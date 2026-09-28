@@ -38,20 +38,10 @@ MORPH_K = 3
 FINISH_X = 0.58
 FINISH_Y = 0.18
 
-# After a click, the old target must disappear/change.
-CONFIRM_MIN_DELAY_MS = 20
-CONFIRM_TIMEOUT_MS = 800
-ALLOW_RETRY = True
-RETRY_AFTER_MS = 180
-MAX_RETRIES = 1
-
-# A click is confirmed from the actual captured screen transition, not only
-# from target geometry. This prevents false confirmation failures when the
-# new target looks similar to the old one for a frame or two.
-CHANGE_PIXEL_DELTA = 18
-CHANGE_MEAN_THRESHOLD = 8.0
-CHANGE_FRACTION_THRESHOLD = 0.10
-PROBE_MARGIN_RATIO = 0.35
+# Keep clicking the detected center until the circle really disappears
+# from the scrcpy capture.
+RECLICK_INTERVAL_MS = 40
+GONE_CONFIRM_FRAMES = 3
 
 OVERLAY_MS = 170
 REGION_REFRESH_SEC = 0.25
@@ -65,6 +55,38 @@ except Exception:
         pass
 
 user32 = ctypes.windll.user32
+
+ULONG_PTR = getattr(wintypes, "ULONG_PTR", ctypes.c_size_t)
+
+
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = [
+        ("dx", wintypes.LONG),
+        ("dy", wintypes.LONG),
+        ("mouseData", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ULONG_PTR),
+    ]
+
+
+class INPUT(ctypes.Structure):
+    _fields_ = [
+        ("type", wintypes.DWORD),
+        ("mi", MOUSEINPUT),
+    ]
+
+
+INPUT_MOUSE = 0
+MOUSEEVENTF_LEFTDOWN = 0x0002
+MOUSEEVENTF_LEFTUP = 0x0004
+
+user32.SendInput.argtypes = [
+    wintypes.UINT,
+    ctypes.POINTER(INPUT),
+    ctypes.c_int,
+]
+user32.SendInput.restype = wintypes.UINT
 
 
 def find_scrcpy():
@@ -718,96 +740,47 @@ def detect_circle(frame):
 
     return best
 
-def make_click_probe(frame, target):
-    """
-    Save a small grayscale region around the target before the click.
-    Later frames are compared against this exact screen area.
-    """
-    H, W = frame.shape[:2]
-    cx = float(target["cx"])
-    cy = float(target["cy"])
-    r = max(float(target["r"]), float(MIN_RADIUS))
-
-    pad = max(6, int(round(r * PROBE_MARGIN_RATIO)))
-    half = max(8, int(round(r + pad)))
-
-    x0 = max(0, int(round(cx - half)))
-    y0 = max(0, int(round(cy - half)))
-    x1 = min(W, int(round(cx + half + 1)))
-    y1 = min(H, int(round(cy + half + 1)))
-
-    if x1 <= x0 or y1 <= y0:
-        return None
-
-    gray = cv2.cvtColor(
-        frame[y0:y1, x0:x1],
-        cv2.COLOR_BGR2GRAY
-    )
-
-    return {
-        "x0": x0,
-        "y0": y0,
-        "x1": x1,
-        "y1": y1,
-        "gray": gray.copy(),
-    }
-
-
-def probe_changed(frame, probe):
-    """
-    Return (changed, mean_abs_difference, changed_fraction).
-    The comparison uses raw capture frames before the debug overlay.
-    """
-    if probe is None:
-        return False, 0.0, 0.0
-
-    x0 = probe["x0"]
-    y0 = probe["y0"]
-    x1 = probe["x1"]
-    y1 = probe["y1"]
-
-    current = frame[y0:y1, x0:x1]
-
-    if current.size == 0:
-        return False, 0.0, 0.0
-
-    current_gray = cv2.cvtColor(
-        current,
-        cv2.COLOR_BGR2GRAY
-    )
-
-    reference = probe["gray"]
-
-    if current_gray.shape != reference.shape:
-        return False, 0.0, 0.0
-
-    diff = cv2.absdiff(
-        current_gray,
-        reference
-    )
-
-    mean_diff = float(np.mean(diff))
-    changed_fraction = float(
-        np.mean(diff >= CHANGE_PIXEL_DELTA)
-    )
-
-    changed = (
-        mean_diff >= CHANGE_MEAN_THRESHOLD
-        or
-        changed_fraction >= CHANGE_FRACTION_THRESHOLD
-    )
-
-    return changed, mean_diff, changed_fraction
-
-
-
 def same_target(a, b):
-    d = math.hypot(a["cx"] - b["cx"], a["cy"] - b["cy"])
-    rr = max(a["r"], b["r"], 1)
-    spatial = d <= max(12, rr * 0.28)
-    size = abs(a["r"] - b["r"]) <= max(10, b["r"] * 0.25)
-    cd = math.sqrt(sum((a["bgr"][i] - b["bgr"][i]) ** 2 for i in range(3)))
-    color = cd <= 45
+    """
+    Decide whether two detections are still the same physical circle.
+    Tolerance is intentionally generous because the detected center can move
+    a few pixels between consecutive screen captures.
+    """
+    d = math.hypot(
+        a["cx"] - b["cx"],
+        a["cy"] - b["cy"]
+    )
+
+    rr = max(
+        float(a["r"]),
+        float(b["r"]),
+        1.0
+    )
+
+    spatial = d <= max(
+        18.0,
+        rr * 0.45
+    )
+
+    size = abs(
+        float(a["r"]) - float(b["r"])
+    ) <= max(
+        12.0,
+        rr * 0.35
+    )
+
+    cd = math.sqrt(
+        sum(
+            (
+                a["bgr"][i] -
+                b["bgr"][i]
+            ) ** 2
+            for i in range(3)
+        )
+    )
+
+    color = cd <= 80.0
+
     return spatial and size and color
 
 
@@ -979,6 +952,27 @@ def p95(a):
     return float(np.percentile(a, 95)) if a else 0.0
 
 
+def click_target_center(target, region, hwnd, tapper):
+    """
+    Click the CURRENT detected center in screen coordinates.
+    """
+    click_x = region[0] + int(target["cx"])
+    click_y = region[1] + int(target["cy"])
+
+    dispatch_ms, ok = tapper.tap(
+        click_x,
+        click_y,
+        hwnd
+    )
+
+    return (
+        click_x,
+        click_y,
+        dispatch_ms,
+        ok
+    )
+
+
 def main():
     auto_click = AUTO_CLICK_START
     print("=" * 70)
@@ -1020,8 +1014,6 @@ def main():
     overlay_time = 0.0
     last_region_update = 0.0
     last_cap = last_det = last_dispatch = last_dt_tap = 0.0
-    last_change_mean = 0.0
-    last_change_fraction = 0.0
     last_confirm_reason = "NONE"
     state = "WAITING"
     frame_count = detected_count = click_count = confirmed = failed = retries = 0
@@ -1060,132 +1052,151 @@ def main():
             det_times.append(last_det)
 
             # ==================================================
-            # WAITING: acquire a target unless the last timed-out
-            # target is still physically unchanged.
+            # TARGET -> CLICK CENTER -> KEEP CLICKING UNTIL THE
+            # CIRCLE DISAPPEARS FROM THE SCRCPY CAPTURE.
+            #
+            # This is the requested behavior:
+            #   1) Detect circle center.
+            #   2) Click its center immediately.
+            #   3) Keep re-clicking the CURRENT center while the circle
+            #      is still visible.
+            #   4) Stop only after the circle is absent for several
+            #      consecutive captured frames.
             # ==================================================
             if pending is None:
-                if blocked_target is not None:
-                    if target is None or not same_target(target, blocked_target):
-                        blocked_target = None
-                        state = "TARGET CHANGED - REACQUIRE"
-                    else:
-                        state = "WAITING FOR TARGET CHANGE"
-
-                if pending is None and blocked_target is None and target is not None:
+                if target is not None:
                     detected_count += 1
+
                     overlay_target = target
                     overlay_time = time.perf_counter()
 
-                    click_x = region[0] + target["cx"]
-                    click_y = region[1] + target["cy"]
+                    (
+                        click_x,
+                        click_y,
+                        dispatch_ms,
+                        ok
+                    ) = click_target_center(
+                        target,
+                        region,
+                        hwnd,
+                        tapper
+                    )
 
-                    if auto_click:
-                        probe = make_click_probe(frame, target)
+                    click_sent = time.perf_counter()
+                    last_dispatch = dispatch_ms
+                    last_dt_tap = (
+                        click_sent - overlay_time
+                    ) * 1000
 
-                        dispatch_ms, ok = tapper.tap(
-                            click_x,
-                            click_y,
-                            hwnd
-                        )
+                    if ok:
+                        click_count += 1
+                        dispatch_times.append(dispatch_ms)
+                        dt_tap_times.append(last_dt_tap)
 
-                        click_sent = time.perf_counter()
-                        last_dispatch = dispatch_ms
-                        last_dt_tap = (
-                            click_sent - overlay_time
-                        ) * 1000
+                        pending = {
+                            "target": target,
+                            "click_x": click_x,
+                            "click_y": click_y,
+                            "started_at": overlay_time,
+                            "last_click_at": click_sent,
+                            "clicks": 1,
+                            "gone_frames": 0,
+                        }
 
-                        if ok:
-                            click_count += 1
-                            dispatch_times.append(dispatch_ms)
-                            dt_tap_times.append(last_dt_tap)
-
-                            pending = {
-                                "target": target,
-                                "click_x": click_x,
-                                "click_y": click_y,
-                                "detected_at": overlay_time,
-                                "click_at": click_sent,
-                                "retries": 0,
-                                "probe": probe,
-                            }
-
-                            state = "CLICK SENT"
-                        else:
-                            state = "TAP FAILED"
+                        last_confirm_reason = "CENTER CLICK"
+                        state = "CLICK CENTER"
                     else:
-                        state = "DETECTED / CLICK OFF"
+                        failed += 1
+                        state = "TAP FAILED"
 
-            # ==================================================
-            # AFTER CLICK: confirm the physical screen transition.
-            # ==================================================
             else:
-                age = (
+                age_ms = (
                     time.perf_counter() -
-                    pending["click_at"]
+                    pending["last_click_at"]
                 ) * 1000
 
-                target_changed = (
-                    target is None
-                    or
-                    not same_target(
+                # --------------------------------------------------
+                # Circle still detected.
+                # Re-detect the center and click THAT current center.
+                # --------------------------------------------------
+                if target is not None:
+                    pending["gone_frames"] = 0
+
+                    same = same_target(
                         target,
                         pending["target"]
                     )
-                )
 
-                pixels_changed, change_mean, change_fraction = (
-                    probe_changed(
-                        frame,
-                        pending.get("probe")
-                    )
-                )
+                    if same:
+                        pending["target"] = target
+                        overlay_target = target
 
-                last_change_mean = change_mean
-                last_change_fraction = change_fraction
+                        # Even when the center moves a little, always click
+                        # the latest detected center rather than the first one.
+                        if age_ms >= RECLICK_INTERVAL_MS:
+                            (
+                                click_x,
+                                click_y,
+                                dispatch_ms,
+                                ok
+                            ) = click_target_center(
+                                target,
+                                region,
+                                hwnd,
+                                tapper
+                            )
 
-                if (
-                    age >= CONFIRM_MIN_DELAY_MS
-                    and
-                    (target_changed or pixels_changed)
-                ):
-                    confirm_ms = (
-                        time.perf_counter() -
-                        pending["detected_at"]
-                    ) * 1000
+                            pending["last_click_at"] = time.perf_counter()
+                            pending["click_x"] = click_x
+                            pending["click_y"] = click_y
+                            pending["clicks"] += 1
 
-                    confirmed += 1
-                    confirm_times.append(confirm_ms)
+                            last_dispatch = dispatch_ms
+                            last_dt_tap = (
+                                pending["last_click_at"] -
+                                overlay_time
+                            ) * 1000
 
-                    if target_changed and pixels_changed:
-                        last_confirm_reason = "TARGET+PIXELS"
-                    elif target_changed:
-                        last_confirm_reason = "TARGET"
+                            if ok:
+                                click_count += 1
+                                retries += 1
+                                dispatch_times.append(dispatch_ms)
+                                dt_tap_times.append(last_dt_tap)
+                                state = "CLICK CENTER - AGAIN"
+                            else:
+                                failed += 1
+                                state = "TAP FAILED - RETRY"
+
                     else:
-                        last_confirm_reason = "PIXELS"
+                        # Old circle is gone and a different target is
+                        # already visible. Complete the old target and
+                        # immediately start clicking the new one.
+                        confirm_ms = (
+                            time.perf_counter() -
+                            pending["started_at"]
+                        ) * 1000
 
-                    pending = None
-                    blocked_target = None
-                    state = "HIT CONFIRMED"
+                        confirmed += 1
+                        confirm_times.append(confirm_ms)
+                        last_confirm_reason = "NEW TARGET"
 
-                    # If the next target is already visible in this frame,
-                    # acquire/click it immediately without an extra frame.
-                    if target is not None and auto_click:
+                        pending = None
+                        state = "HIT - NEXT TARGET"
+
                         detected_count += 1
                         overlay_target = target
                         overlay_time = time.perf_counter()
 
-                        click_x = region[0] + target["cx"]
-                        click_y = region[1] + target["cy"]
-
-                        probe = make_click_probe(
-                            frame,
-                            target
-                        )
-
-                        dispatch_ms, ok = tapper.tap(
+                        (
                             click_x,
                             click_y,
-                            hwnd
+                            dispatch_ms,
+                            ok
+                        ) = click_target_center(
+                            target,
+                            region,
+                            hwnd,
+                            tapper
                         )
 
                         click_sent = time.perf_counter()
@@ -1203,45 +1214,70 @@ def main():
                                 "target": target,
                                 "click_x": click_x,
                                 "click_y": click_y,
-                                "detected_at": overlay_time,
-                                "click_at": click_sent,
-                                "retries": 0,
-                                "probe": probe,
+                                "started_at": overlay_time,
+                                "last_click_at": click_sent,
+                                "clicks": 1,
+                                "gone_frames": 0,
                             }
 
-                            state = "CLICK SENT - NEXT TARGET"
+                            state = "CLICK CENTER - NEXT"
                         else:
-                            state = "TAP FAILED - NEXT TARGET"
+                            failed += 1
+                            state = "TAP FAILED - NEXT"
 
-                elif (
-                    ALLOW_RETRY
-                    and
-                    pending["retries"] < MAX_RETRIES
-                    and
-                    age >= RETRY_AFTER_MS
-                    and
-                    not target_changed
-                ):
-                    dispatch_ms, ok = tapper.tap(
-                        pending["click_x"],
-                        pending["click_y"],
-                        hwnd
-                    )
+                # --------------------------------------------------
+                # Detector did not see the circle in this frame.
+                # Do NOT assume it is gone from one missed frame.
+                #
+                # Keep clicking the LAST KNOWN CENTER until the circle
+                # has been absent for GONE_CONFIRM_FRAMES consecutive
+                # captures.
+                # --------------------------------------------------
+                else:
+                    pending["gone_frames"] += 1
 
-                    pending["retries"] += 1
-                    retries += 1
-                    last_dispatch = dispatch_ms
-                    state = "RETRY"
+                    if pending["gone_frames"] < GONE_CONFIRM_FRAMES:
+                        if age_ms >= RECLICK_INTERVAL_MS:
+                            dispatch_ms, ok = tapper.tap(
+                                pending["click_x"],
+                                pending["click_y"],
+                                hwnd
+                            )
 
-                    if ok:
-                        dispatch_times.append(dispatch_ms)
-                        pending["click_at"] = time.perf_counter()
+                            pending["last_click_at"] = time.perf_counter()
+                            pending["clicks"] += 1
+                            last_dispatch = dispatch_ms
+                            last_dt_tap = (
+                                pending["last_click_at"] -
+                                overlay_time
+                            ) * 1000
 
-                elif age >= CONFIRM_TIMEOUT_MS:
-                    failed += 1
-                    blocked_target = pending["target"]
-                    pending = None
-                    state = "CONFIRM TIMEOUT - BLOCKED"
+                            if ok:
+                                click_count += 1
+                                retries += 1
+                                dispatch_times.append(dispatch_ms)
+                                dt_tap_times.append(last_dt_tap)
+                                state = (
+                                    f"CLICK LAST CENTER "
+                                    f"({pending['gone_frames']}/{GONE_CONFIRM_FRAMES})"
+                                )
+                            else:
+                                failed += 1
+                                state = "TAP FAILED - LAST CENTER"
+                    else:
+                        confirm_ms = (
+                            time.perf_counter() -
+                            pending["started_at"]
+                        ) * 1000
+
+                        confirmed += 1
+                        confirm_times.append(confirm_ms)
+                        last_confirm_reason = (
+                            f"GONE {GONE_CONFIRM_FRAMES} FRAMES"
+                        )
+
+                        pending = None
+                        state = "HIT CONFIRMED"
 
             # ==================================================
             # OUTPUT / VISUAL TEST OVERLAY
@@ -1263,9 +1299,10 @@ def main():
                     f"Tap dispatch: {last_dispatch:.2f} ms",
                     f"Detect->Tap: {last_dt_tap:.2f} ms",
                     f"Probe change: {last_change_mean:.1f} / {last_change_fraction * 100:.1f}%",
-                    f"Confirm by: {last_confirm_reason}",
+                    f"Confirm: {last_confirm_reason}",
                     f"Targets: {detected_count}  Clicks: {click_count}",
-                    f"Confirmed: {confirmed}  Failed: {failed}",
+                    f"Completed: {confirmed}  Tap failures: {failed}",
+                    f"Extra center clicks: {retries}",
                 ]
                 yy = 24
                 for s in text_lines:
@@ -1284,8 +1321,6 @@ def main():
                     frame_count = detected_count = click_count = confirmed = failed = retries = 0
                     cap_times.clear(); det_times.clear(); dispatch_times.clear(); dt_tap_times.clear(); confirm_times.clear()
                     run_start = time.perf_counter()
-                    last_change_mean = 0.0
-                    last_change_fraction = 0.0
                     last_confirm_reason = "NONE"
                     pending = None
                     blocked_target = None
@@ -1309,9 +1344,9 @@ def main():
     print(f"Loop FPS              : {frame_count / elapsed:.2f}")
     print(f"Targets detected      : {detected_count}")
     print(f"Clicks sent           : {click_count}")
-    print(f"Hits visually confirm : {confirmed}")
-    print(f"Confirmation failures : {failed}")
-    print(f"Retries               : {retries}")
+    print(f"Targets completed     : {confirmed}")
+    print(f"Tap failures          : {failed}")
+    print(f"Extra center clicks   : {retries}")
     print(f"Avg capture           : {avg(cap_times):.2f} ms")
     print(f"Avg OpenCV detection  : {avg(det_times):.2f} ms")
     print(f"Avg tap dispatch      : {avg(dispatch_times):.2f} ms")
