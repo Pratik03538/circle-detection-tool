@@ -24,6 +24,21 @@ MIN_VALUE = 65
 MIN_SATURATION = 0
 MIN_AREA = 450
 MIN_RADIUS = 12
+
+# Primary target detector: grayscale Hough geometry + interior colour
+# consistency. This is deliberately independent of the target hue.
+HOUGH_SCALE = 0.50
+HOUGH_DP = 1.20
+HOUGH_PARAM1 = 85
+HOUGH_PARAM2 = 24
+HOUGH_MIN_RADIUS = 18          # radius in the downscaled image (~36 px actual)
+HOUGH_MAX_RADIUS_RATIO = 0.75  # allow a large circle clipped by an edge
+HOUGH_MIN_DIST = 35
+
+MIN_TARGET_COLOR_CONSISTENCY = 0.78
+TARGET_COLOR_DISTANCE = 24.0
+MIN_TARGET_BG_CONTRAST = 18.0
+MIN_TARGET_EDGE_STRENGTH = 18.0
 MAX_RADIUS_RATIO = 0.48
 MIN_CIRCULARITY = 0.68
 MIN_CIRCULARITY_EDGE = 0.42
@@ -511,7 +526,7 @@ def color_consistency(frame, contour, x, y, w, h):
     return consistent
 
 
-def detect_circle(frame):
+def detect_circle_contour(frame):
     """
     Detect the random filled circle.
 
@@ -931,6 +946,391 @@ def detect_circle(frame):
         }
 
     return best
+
+def detect_circle_hough(frame):
+    """
+    Primary detector for the supplied challenge screenshots.
+
+    The target is a large filled circle on a dark, smoothly varying
+    background. Its colour can change, so hue/saturation is NOT used to
+    locate the circle.
+
+    Hough geometry finds the circle even when 60-70% is the visible portion
+    at a screen edge. The candidate is then validated using:
+      - a uniform interior colour check
+      - inner-vs-background contrast
+      - circular edge strength
+
+    UI text/buttons and collections of many tiny/mixed circles fail these
+    checks and are ignored.
+    """
+    H, W = frame.shape[:2]
+
+    small_w = max(1, int(round(W * HOUGH_SCALE)))
+    small_h = max(1, int(round(H * HOUGH_SCALE)))
+
+    small = cv2.resize(
+        frame,
+        (small_w, small_h),
+        interpolation=cv2.INTER_AREA
+    )
+
+    gray = cv2.cvtColor(
+        small,
+        cv2.COLOR_BGR2GRAY
+    )
+
+    gray = cv2.GaussianBlur(
+        gray,
+        (7, 7),
+        1.2
+    )
+
+    max_radius = max(
+        HOUGH_MIN_RADIUS,
+        int(round(min(small_w, small_h) * HOUGH_MAX_RADIUS_RATIO))
+    )
+
+    min_radius = min(
+        HOUGH_MIN_RADIUS,
+        max_radius
+    )
+
+    circles = cv2.HoughCircles(
+        gray,
+        cv2.HOUGH_GRADIENT,
+        dp=HOUGH_DP,
+        minDist=HOUGH_MIN_DIST,
+        param1=HOUGH_PARAM1,
+        param2=HOUGH_PARAM2,
+        minRadius=min_radius,
+        maxRadius=max_radius
+    )
+
+    if circles is None:
+        return None
+
+    # One gradient image is enough for all candidate validation.
+    gx = cv2.Sobel(
+        gray,
+        cv2.CV_32F,
+        1,
+        0,
+        ksize=3
+    )
+    gy = cv2.Sobel(
+        gray,
+        cv2.CV_32F,
+        0,
+        1,
+        ksize=3
+    )
+
+    gradient = cv2.magnitude(
+        gx,
+        gy
+    )
+
+    yy, xx = np.ogrid[
+        :small_h,
+        :small_w
+    ]
+
+    best = None
+    best_score = -1.0
+
+    # Hough returns strongest circles first, but still score all reasonable
+    # candidates so text/edge artefacts cannot win accidentally.
+    for circle in np.round(circles[0], 2):
+        scx, scy, sr = (
+            float(circle[0]),
+            float(circle[1]),
+            float(circle[2])
+        )
+
+        rr = (
+            (xx - scx) ** 2 +
+            (yy - scy) ** 2
+        )
+
+        # Filled interior used for colour uniformity.
+        inner = (
+            rr <=
+            (sr * 0.62) ** 2
+        )
+
+        # Thin annulus around the expected circle edge.
+        ring = (
+            (rr >= (sr * 0.90) ** 2) &
+            (rr <= (sr * 1.08) ** 2)
+        )
+
+        interior_pixels = small[inner]
+        ring_pixels = small[ring]
+
+        if len(interior_pixels) < 80 or len(ring_pixels) < 40:
+            continue
+
+        median_bgr = np.median(
+            interior_pixels,
+            axis=0
+        )
+
+        colour_distance = np.sqrt(
+            np.sum(
+                (
+                    interior_pixels.astype(np.float32)
+                    -
+                    median_bgr.astype(np.float32)
+                ) ** 2,
+                axis=1
+            )
+        )
+
+        consistency = float(
+            np.mean(
+                colour_distance <= TARGET_COLOR_DISTANCE
+            )
+        )
+
+        if consistency < MIN_TARGET_COLOR_CONSISTENCY:
+            continue
+
+        ring_median = np.median(
+            ring_pixels,
+            axis=0
+        )
+
+        background_contrast = float(
+            np.linalg.norm(
+                median_bgr.astype(np.float32)
+                -
+                ring_median.astype(np.float32)
+            )
+        )
+
+        # A real target has a clear colour/brightness boundary. Text can
+        # have strong edges but its interior does not differ coherently from
+        # its surrounding field over a whole disk.
+        if background_contrast < MIN_TARGET_BG_CONTRAST:
+            continue
+
+        edge_strength = float(
+            np.mean(
+                gradient[ring]
+            )
+        )
+
+        if edge_strength < MIN_TARGET_EDGE_STRENGTH:
+            continue
+
+        # Visible-edge estimate. For an off-screen target, only the
+        # in-bounds part contributes. Reject extremely tiny visible arcs.
+        circumference_samples = 72
+        angles = np.linspace(
+            0.0,
+            2.0 * math.pi,
+            circumference_samples,
+            endpoint=False
+        )
+
+        sx = np.rint(
+            scx +
+            sr *
+            np.cos(angles)
+        ).astype(np.int32)
+
+        sy = np.rint(
+            scy +
+            sr *
+            np.sin(angles)
+        ).astype(np.int32)
+
+        inside_screen = (
+            (sx >= 0) &
+            (sx < small_w) &
+            (sy >= 0) &
+            (sy < small_h)
+        )
+
+        visible_arc_fraction = float(
+            np.mean(inside_screen)
+        )
+
+        if visible_arc_fraction < 0.50:
+            continue
+
+        # Larger circles are preferred only very slightly. Geometry,
+        # consistency and contrast remain the dominant signals.
+        size_quality = min(
+            1.0,
+            sr /
+            max(
+                float(HOUGH_MIN_RADIUS),
+                1.0
+            )
+        )
+
+        score = (
+            0.48 *
+            consistency
+            +
+            0.24 *
+            min(
+                background_contrast / 100.0,
+                1.0
+            )
+            +
+            0.18 *
+            min(
+                edge_strength / 80.0,
+                1.0
+            )
+            +
+            0.07 *
+            visible_arc_fraction
+            +
+            0.03 *
+            size_quality
+        )
+
+        if score <= best_score:
+            continue
+
+        actual_cx = int(
+            round(
+                scx /
+                HOUGH_SCALE
+            )
+        )
+
+        actual_cy = int(
+            round(
+                scy /
+                HOUGH_SCALE
+            )
+        )
+
+        actual_r = float(
+            sr /
+            HOUGH_SCALE
+        )
+
+        # Keep click point inside the captured client area. For the
+        # screenshot-style edge circle the true center is still visible;
+        # if a fit ever lands just outside, clamp only to the capture edge.
+        actual_cx = max(
+            0,
+            min(
+                W - 1,
+                actual_cx
+            )
+        )
+
+        actual_cy = max(
+            0,
+            min(
+                H - 1,
+                actual_cy
+            )
+        )
+
+        half = int(
+            round(
+                sr /
+                HOUGH_SCALE
+            )
+        )
+
+        x0 = max(
+            0,
+            actual_cx - half
+        )
+        y0 = max(
+            0,
+            actual_cy - half
+        )
+        x1 = min(
+            W - 1,
+            actual_cx + half
+        )
+        y1 = min(
+            H - 1,
+            actual_cy + half
+        )
+
+        best_score = score
+
+        best = {
+            "cx": actual_cx,
+            "cy": actual_cy,
+            "r": actual_r,
+            "bbox": (
+                x0,
+                y0,
+                max(1, x1 - x0 + 1),
+                max(1, y1 - y0 + 1)
+            ),
+            "area": float(
+                math.pi *
+                actual_r *
+                actual_r
+            ),
+            "score": float(score),
+            "circularity": 1.0,
+            "fill": 1.0,
+            "solidity": 1.0,
+            "edge": bool(
+                actual_cx - actual_r < 1
+                or
+                actual_cy - actual_r < 1
+                or
+                actual_cx + actual_r >= W - 1
+                or
+                actual_cy + actual_r >= H - 1
+            ),
+            "bgr": tuple(
+                int(v)
+                for v in frame[
+                    actual_cy,
+                    actual_cx
+                ]
+            ),
+            "fit_center": (
+                float(actual_cx),
+                float(actual_cy)
+            ),
+            "dt_center": (
+                float(actual_cx),
+                float(actual_cy)
+            ),
+            "dt_radius": float(actual_r),
+            "color_consistency": float(consistency),
+            "background_contrast": float(background_contrast),
+            "edge_strength": float(edge_strength),
+            "visible_arc_fraction": float(
+                visible_arc_fraction
+            )
+        }
+
+    return best
+
+
+def detect_circle(frame):
+    """
+    Primary screenshot-matched detector with a conservative contour
+    fallback. The Hough detector is preferred because it handles large
+    edge-clipped circles directly.
+    """
+    target = detect_circle_hough(frame)
+
+    if target is not None:
+        return target
+
+    # Fallback keeps the existing contour path available for unusual
+    # frames where the edge detector temporarily misses the circle.
+    return detect_circle_contour(frame)
+
 
 def same_target(a, b):
     """
