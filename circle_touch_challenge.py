@@ -1,10 +1,6 @@
 import ctypes
 from ctypes import wintypes
 import math
-import re
-import shutil
-import os
-import subprocess
 import time
 from typing import Optional, Tuple
 
@@ -13,32 +9,28 @@ import numpy as np
 
 # ============================================================
 # CIRCLE TOUCH CHALLENGE
-# Android phone -> scrcpy window -> OpenCV -> ADB touch
+# Android phone -> scrcpy window -> DXCam/MSS -> OpenCV -> Windows click
 # ============================================================
 
 SCRCPY_TITLE = "CHESS_MOBILE"
 OUTPUT_TITLE = "CIRCLE TOUCH - TEST OUTPUT"
 
-# Set this only when adb.exe is not discoverable automatically.
-# Example: r"C:\\scrcpy\\adb.exe"
-ADB_EXE = ""
-SCRCPY_EXE = "scrcpy.exe"
-ADB_PATH = None
 AUTO_CLICK_START = True
 SHOW_OUTPUT = True
 DISPLAY_EVERY = 1
 
 # Detection
 MIN_VALUE = 65
-MIN_SATURATION = 10
+MIN_SATURATION = 0
 MIN_AREA = 180
 MIN_RADIUS = 8
 MAX_RADIUS_RATIO = 0.48
-MIN_CIRCULARITY = 0.38
-MIN_CIRCULARITY_EDGE = 0.22
+MIN_CIRCULARITY = 0.68
+MIN_CIRCULARITY_EDGE = 0.42
 MIN_FILL = 0.52
-MIN_ASPECT = 0.55
-MAX_ASPECT = 1.80
+MIN_SOLIDITY = 0.84
+MIN_ASPECT = 0.60
+MAX_ASPECT = 1.67
 MORPH_K = 3
 
 # The screenshots show a yellow Finish button at upper-right.
@@ -54,7 +46,6 @@ MAX_RETRIES = 1
 
 OVERLAY_MS = 170
 REGION_REFRESH_SEC = 0.25
-PERSISTENT_ADB = False
 
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(2)
@@ -65,81 +56,6 @@ except Exception:
         pass
 
 user32 = ctypes.windll.user32
-
-
-def resolve_adb():
-    """Find adb.exe without requiring adb to be on PATH."""
-    candidates = []
-
-    if ADB_EXE:
-        candidates.append(ADB_EXE)
-
-    # Environment variables commonly used by Android SDK.
-    for key in ("ADB_PATH", "ANDROID_HOME", "ANDROID_SDK_ROOT"):
-        value = os.environ.get(key, "")
-        if value:
-            pth = value
-            if key in ("ANDROID_HOME", "ANDROID_SDK_ROOT"):
-                pth = os.path.join(value, "platform-tools", "adb.exe")
-            candidates.append(pth)
-
-    local_appdata = os.environ.get("LOCALAPPDATA", "")
-    user_profile = os.environ.get("USERPROFILE", "")
-    if local_appdata:
-        candidates.append(os.path.join(local_appdata, "Android", "Sdk", "platform-tools", "adb.exe"))
-    if user_profile:
-        candidates.append(os.path.join(user_profile, "AppData", "Local", "Android", "Sdk", "platform-tools", "adb.exe"))
-
-    # If scrcpy is on PATH, look beside scrcpy.exe too. Official Windows
-    # scrcpy bundles commonly keep adb.exe in the same directory.
-    scrcpy_found = shutil.which(SCRCPY_EXE) or shutil.which("scrcpy")
-    if scrcpy_found:
-        candidates.append(os.path.join(os.path.dirname(scrcpy_found), "adb.exe"))
-
-    # Finally, normal PATH lookup.
-    path_adb = shutil.which("adb")
-    if path_adb:
-        candidates.append(path_adb)
-
-    for candidate in candidates:
-        if candidate and os.path.isfile(candidate):
-            return os.path.abspath(candidate)
-    return None
-
-
-ADB_PATH = resolve_adb()
-
-
-def run_adb(args, timeout=3.0):
-    if not ADB_PATH:
-        raise FileNotFoundError(
-            "adb.exe not found. Put adb.exe on PATH or set ADB_EXE in this script."
-        )
-    return subprocess.run(
-        [ADB_PATH, *args],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=timeout,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
-
-
-def adb_ready():
-    try:
-        r = run_adb(["get-state"], 2)
-        return r.returncode == 0 and r.stdout.strip() == "device"
-    except Exception:
-        return False
-
-
-def device_size():
-    try:
-        r = run_adb(["shell", "wm", "size"], 3)
-        matches = re.findall(r"(\d+)x(\d+)", (r.stdout or "") + " " + (r.stderr or ""))
-        return tuple(map(int, matches[-1])) if matches else None
-    except Exception:
-        return None
 
 
 def find_scrcpy():
@@ -227,6 +143,11 @@ def target_mask(frame):
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k, iterations=1)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=1)
     return mask
+
+
+# Backward-compatible name used by the detector.
+def make_target_mask(frame):
+    return target_mask(frame)
 
 
 def ignored_finish(x, y, w, h, W, H):
@@ -380,17 +301,6 @@ def detect_circle(frame):
 
         x, y, w, h = cv2.boundingRect(contour)
 
-        # Ignore the Finish button region from your screenshots.
-        if is_finish_button_area(
-            x,
-            y,
-            w,
-            h,
-            W,
-            H
-        ):
-            continue
-
         if (
             w < 2 * MIN_RADIUS or
             h < 2 * MIN_RADIUS
@@ -443,6 +353,18 @@ def detect_circle(frame):
         )
 
         if fill < MIN_FILL:
+            continue
+
+        # A circle should be compact and close to convex.
+        hull = cv2.convexHull(contour)
+        hull_area = cv2.contourArea(hull)
+
+        if hull_area <= 0:
+            continue
+
+        solidity = area / float(hull_area)
+
+        if solidity < MIN_SOLIDITY:
             continue
 
         # ----------------------------------------------------
@@ -521,13 +443,13 @@ def detect_circle(frame):
         if not touches_edge:
 
             center_x = (
-                0.65 * fit_cx +
-                0.35 * dt_cx
+                0.35 * fit_cx +
+                0.65 * dt_cx
             )
 
             center_y = (
-                0.65 * fit_cy +
-                0.35 * dt_cy
+                0.35 * fit_cy +
+                0.65 * dt_cy
             )
 
             estimated_radius = (
@@ -594,6 +516,33 @@ def detect_circle(frame):
                 )
             )
         )
+
+        # ----------------------------------------------------
+        # Radial consistency check.
+        # This rejects bright UI rectangles/text while remaining
+        # permissive for targets touching the screen edge.
+        # ----------------------------------------------------
+        contour_pts = contour.reshape(-1, 2).astype(np.float64)
+
+        if len(contour_pts) >= 8:
+            radial = np.sqrt(
+                (contour_pts[:, 0] - center_x) ** 2 +
+                (contour_pts[:, 1] - center_y) ** 2
+            )
+
+            radial_median = float(np.median(radial))
+            radial_error = float(
+                np.median(np.abs(radial - radial_median))
+            )
+
+            radial_limit = (
+                max(4.0, radial_median * 0.28)
+                if touches_edge
+                else max(3.0, radial_median * 0.16)
+            )
+
+            if radial_error > radial_limit:
+                continue
 
         # ----------------------------------------------------
         # Center sanity check.
@@ -693,6 +642,7 @@ def detect_circle(frame):
             "score": float(score),
             "circularity": float(circularity),
             "fill": float(fill),
+            "solidity": float(solidity),
             "edge": bool(touches_edge),
             "bgr": center_bgr,
             "fit_center": (
