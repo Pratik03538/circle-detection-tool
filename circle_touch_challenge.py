@@ -1395,6 +1395,11 @@ def main():
                                      age, state)
 
                 total_fps = frame_count / max(time.perf_counter() - run_start, 1e-6)
+                color_consistency_display = (
+                    target.get("color_consistency", 0.0)
+                    if target is not None else 0.0
+                )
+
                 text_lines = [
                     f"STATE: {state}",
                     f"FPS: {total_fps:.1f}",
@@ -1403,10 +1408,7 @@ def main():
                     f"Tap dispatch: {last_dispatch:.2f} ms",
                     f"Detect->Tap: {last_dt_tap:.2f} ms",
                     f"Center clicks: {pending['clicks'] if pending is not None else 0}",
-                    f"Color consistency: {(
-                        target.get('color_consistency', 0.0)
-                        if target is not None else 0.0
-                    ):.2f}",
+                    f"Color consistency: {color_consistency_display:.2f}",
                     f"Confirm: {last_confirm_reason}",
                     f"Targets: {detected_count}  Clicks: {click_count}",
                     f"Completed: {confirmed}  Tap failures: {failed}",
