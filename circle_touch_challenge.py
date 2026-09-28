@@ -22,8 +22,8 @@ DISPLAY_EVERY = 1
 # Detection
 MIN_VALUE = 65
 MIN_SATURATION = 0
-MIN_AREA = 450
-MIN_RADIUS = 12
+MIN_AREA = 900
+MIN_RADIUS = 24
 
 # Primary target detector: grayscale Hough geometry + interior colour
 # consistency. This is deliberately independent of the target hue.
