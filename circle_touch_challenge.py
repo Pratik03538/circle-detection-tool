@@ -22,24 +22,8 @@ DISPLAY_EVERY = 1
 # Detection
 MIN_VALUE = 65
 MIN_SATURATION = 0
-MIN_AREA = 900
-MIN_RADIUS = 24
-
-# Primary target detector: grayscale Hough geometry + interior colour
-# consistency. This is deliberately independent of the target hue.
-HOUGH_SCALE = 0.50
-HOUGH_DP = 1.20
-HOUGH_PARAM1 = 85
-HOUGH_PARAM2 = 24
-HOUGH_MIN_RADIUS = 35          # ~70 px actual; ignores tiny/random circles
-HOUGH_MAX_RADIUS_RATIO = 0.75  # allow a large circle clipped by an edge
-HOUGH_MIN_DIST = 45
-HOUGH_MIN_SCORE = 0.72
-
-MIN_TARGET_COLOR_CONSISTENCY = 0.84
-TARGET_COLOR_DISTANCE = 24.0
-MIN_TARGET_BG_CONTRAST = 80.0
-MIN_TARGET_EDGE_STRENGTH = 18.0
+MIN_AREA = 450
+MIN_RADIUS = 12
 MAX_RADIUS_RATIO = 0.48
 MIN_CIRCULARITY = 0.68
 MIN_CIRCULARITY_EDGE = 0.42
@@ -49,9 +33,15 @@ MIN_ASPECT = 0.60
 MAX_ASPECT = 1.67
 MORPH_K = 3
 
-# No fixed target position is assumed.
-# The detector is geometry/contrast driven so the circle may move around
-# the playable area, including close to an edge.
+# Reject candidates that are too colour-mixed to be the intended
+# single-colour target circle.
+MIN_COLOR_CONSISTENCY = 0.82
+COLOR_DISTANCE_THRESHOLD = 34.0
+
+# The screenshots show a yellow Finish button at upper-right.
+# Only that common button area is ignored; circles elsewhere are allowed.
+FINISH_X = 0.58
+FINISH_Y = 0.18
 
 # Keep clicking the detected center until the circle really disappears
 # from the scrcpy capture.
@@ -71,6 +61,37 @@ except Exception:
 
 user32 = ctypes.windll.user32
 
+ULONG_PTR = getattr(wintypes, "ULONG_PTR", ctypes.c_size_t)
+
+
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = [
+        ("dx", wintypes.LONG),
+        ("dy", wintypes.LONG),
+        ("mouseData", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ULONG_PTR),
+    ]
+
+
+class INPUT(ctypes.Structure):
+    _fields_ = [
+        ("type", wintypes.DWORD),
+        ("mi", MOUSEINPUT),
+    ]
+
+
+INPUT_MOUSE = 0
+MOUSEEVENTF_LEFTDOWN = 0x0002
+MOUSEEVENTF_LEFTUP = 0x0004
+
+user32.SendInput.argtypes = [
+    wintypes.UINT,
+    ctypes.POINTER(INPUT),
+    ctypes.c_int,
+]
+user32.SendInput.restype = wintypes.UINT
 
 
 def find_scrcpy():
@@ -154,98 +175,53 @@ class Capture:
 
 class Tapper:
     """
-    Click the existing scrcpy window using the same Windows mouse path as a
-    normal manual click.
+    Send a click directly to the scrcpy window without moving the
+    real Windows cursor.
 
-    The real cursor is saved and restored immediately after LEFT DOWN/UP,
-    so it does not remain on the target.
+    The cursor remains wherever the user leaves it.
     """
+
+    WM_LBUTTONDOWN = 0x0201
+    WM_LBUTTONUP = 0x0202
+    MK_LBUTTON = 0x0001
+
+    @staticmethod
+    def _lparam(x, y):
+        # Client coordinates packed into the Windows mouse-message LPARAM.
+        return ctypes.c_uint32(
+            (int(y) << 16) | (int(x) & 0xFFFF)
+        ).value
 
     def tap(self, x, y, hwnd):
         t0 = time.perf_counter()
 
-        old_point = wintypes.POINT()
-
         try:
-            if not user32.GetCursorPos(
-                ctypes.byref(old_point)
-            ):
-                return (
-                    (time.perf_counter() - t0) * 1000.0,
-                    False
-                )
+            # hwnd receives client coordinates. No focus change and no
+            # SetCursorPos: the user's actual cursor is untouched.
+            lparam = self._lparam(x, y)
 
-            px = int(round(x))
-            py = int(round(y))
-
-            # Safety: never inject outside the actual scrcpy client area.
-            region = client_region(hwnd)
-
-            if region is None:
-                return (
-                    (time.perf_counter() - t0) * 1000.0,
-                    False
-                )
-
-            left, top, right, bottom = region
-
-            if not (
-                left <= px < right
-                and
-                top <= py < bottom
-            ):
-                return (
-                    (time.perf_counter() - t0) * 1000.0,
-                    False
-                )
-
-            # Put the input target on scrcpy exactly as in a normal manual
-            # mouse interaction.
-            user32.SetForegroundWindow(hwnd)
-
-            if not user32.SetCursorPos(px, py):
-                return (
-                    (time.perf_counter() - t0) * 1000.0,
-                    False
-                )
-
-            user32.mouse_event(
-                MOUSEEVENTF_LEFTDOWN,
-                0,
-                0,
-                0,
-                0
+            down_ok = user32.PostMessageW(
+                hwnd,
+                self.WM_LBUTTONDOWN,
+                self.MK_LBUTTON,
+                lparam
             )
 
-            user32.mouse_event(
-                MOUSEEVENTF_LEFTUP,
+            up_ok = user32.PostMessageW(
+                hwnd,
+                self.WM_LBUTTONUP,
                 0,
-                0,
-                0,
-                0
+                lparam
             )
 
-            # Restore the user's cursor immediately. The actual mouse
-            # down/up has already been delivered synchronously.
-            user32.SetCursorPos(
-                old_point.x,
-                old_point.y
-            )
+            ok = bool(down_ok and up_ok)
 
             return (
                 (time.perf_counter() - t0) * 1000.0,
-                True
+                ok
             )
 
         except Exception:
-            try:
-                user32.SetCursorPos(
-                    old_point.x,
-                    old_point.y
-                )
-            except Exception:
-                pass
-
             return (
                 (time.perf_counter() - t0) * 1000.0,
                 False
@@ -268,6 +244,10 @@ def target_mask(frame):
 # Backward-compatible name used by the detector.
 def make_target_mask(frame):
     return target_mask(frame)
+
+
+def ignored_finish(x, y, w, h, W, H):
+    return x >= int(W * FINISH_X) and y <= int(H * FINISH_Y)
 
 
 def fit_circle_least_squares(contour):
@@ -450,7 +430,7 @@ def color_consistency(frame, contour, x, y, w, h):
     return consistent
 
 
-def detect_circle_contour(frame):
+def detect_circle(frame):
     """
     Detect the random filled circle.
 
@@ -871,409 +851,6 @@ def detect_circle_contour(frame):
 
     return best
 
-def detect_circle_hough(frame):
-    """
-    Primary detector for the supplied challenge screenshots.
-
-    The target is a large filled circle on a dark, smoothly varying
-    background. Its colour can change, so hue/saturation is NOT used to
-    locate the circle.
-
-    Hough geometry finds the circle even when 60-70% is the visible portion
-    at a screen edge. The candidate is then validated using:
-      - a uniform interior colour check
-      - inner-vs-background contrast
-      - circular edge strength
-
-    UI text/buttons and collections of many tiny/mixed circles fail these
-    checks and are ignored.
-    """
-    H, W = frame.shape[:2]
-
-    small_w = max(1, int(round(W * HOUGH_SCALE)))
-    small_h = max(1, int(round(H * HOUGH_SCALE)))
-
-    small = cv2.resize(
-        frame,
-        (small_w, small_h),
-        interpolation=cv2.INTER_AREA
-    )
-
-    gray = cv2.cvtColor(
-        small,
-        cv2.COLOR_BGR2GRAY
-    )
-
-    gray = cv2.GaussianBlur(
-        gray,
-        (7, 7),
-        1.2
-    )
-
-    max_radius = max(
-        HOUGH_MIN_RADIUS,
-        int(round(min(small_w, small_h) * HOUGH_MAX_RADIUS_RATIO))
-    )
-
-    min_radius = min(
-        HOUGH_MIN_RADIUS,
-        max_radius
-    )
-
-    circles = cv2.HoughCircles(
-        gray,
-        cv2.HOUGH_GRADIENT,
-        dp=HOUGH_DP,
-        minDist=HOUGH_MIN_DIST,
-        param1=HOUGH_PARAM1,
-        param2=HOUGH_PARAM2,
-        minRadius=min_radius,
-        maxRadius=max_radius
-    )
-
-    if circles is None:
-        return None
-
-    # One gradient image is enough for all candidate validation.
-    gx = cv2.Sobel(
-        gray,
-        cv2.CV_32F,
-        1,
-        0,
-        ksize=3
-    )
-    gy = cv2.Sobel(
-        gray,
-        cv2.CV_32F,
-        0,
-        1,
-        ksize=3
-    )
-
-    gradient = cv2.magnitude(
-        gx,
-        gy
-    )
-
-    yy, xx = np.ogrid[
-        :small_h,
-        :small_w
-    ]
-
-    best = None
-    best_score = -1.0
-
-    # Hough returns strongest circles first, but still score all reasonable
-    # candidates so text/edge artefacts cannot win accidentally.
-    for circle in np.round(circles[0], 2):
-        scx, scy, sr = (
-            float(circle[0]),
-            float(circle[1]),
-            float(circle[2])
-        )
-
-        rr = (
-            (xx - scx) ** 2 +
-            (yy - scy) ** 2
-        )
-
-        # Filled interior used for colour uniformity.
-        inner = (
-            rr <=
-            (sr * 0.62) ** 2
-        )
-
-        # Thin annulus around the expected circle edge.
-        ring = (
-            (rr >= (sr * 0.90) ** 2) &
-            (rr <= (sr * 1.08) ** 2)
-        )
-
-        interior_pixels = small[inner]
-        ring_pixels = small[ring]
-
-        if len(interior_pixels) < 80 or len(ring_pixels) < 40:
-            continue
-
-        median_bgr = np.median(
-            interior_pixels,
-            axis=0
-        )
-
-        colour_distance = np.sqrt(
-            np.sum(
-                (
-                    interior_pixels.astype(np.float32)
-                    -
-                    median_bgr.astype(np.float32)
-                ) ** 2,
-                axis=1
-            )
-        )
-
-        consistency = float(
-            np.mean(
-                colour_distance <= TARGET_COLOR_DISTANCE
-            )
-        )
-
-        if consistency < MIN_TARGET_COLOR_CONSISTENCY:
-            continue
-
-        # The exact center of a filled circle should resemble the dominant
-        # interior colour. This rejects many Hough detections on text/edges.
-        center_bgr_small = small[
-            max(0, min(small_h - 1, int(round(scy)))),
-            max(0, min(small_w - 1, int(round(scx))))
-        ].astype(np.float32)
-
-        center_distance = float(
-            np.linalg.norm(
-                center_bgr_small -
-                median_bgr.astype(np.float32)
-            )
-        )
-
-        if center_distance > TARGET_COLOR_DISTANCE * 1.5:
-            continue
-
-        ring_median = np.median(
-            ring_pixels,
-            axis=0
-        )
-
-        background_contrast = float(
-            np.linalg.norm(
-                median_bgr.astype(np.float32)
-                -
-                ring_median.astype(np.float32)
-            )
-        )
-
-        # A real target has a clear colour/brightness boundary. Text can
-        # have strong edges but its interior does not differ coherently from
-        # its surrounding field over a whole disk.
-        if background_contrast < MIN_TARGET_BG_CONTRAST:
-            continue
-
-        edge_strength = float(
-            np.mean(
-                gradient[ring]
-            )
-        )
-
-        if edge_strength < MIN_TARGET_EDGE_STRENGTH:
-            continue
-
-        # Visible-edge estimate. For an off-screen target, only the
-        # in-bounds part contributes. Reject extremely tiny visible arcs.
-        circumference_samples = 72
-        angles = np.linspace(
-            0.0,
-            2.0 * math.pi,
-            circumference_samples,
-            endpoint=False
-        )
-
-        sx = np.rint(
-            scx +
-            sr *
-            np.cos(angles)
-        ).astype(np.int32)
-
-        sy = np.rint(
-            scy +
-            sr *
-            np.sin(angles)
-        ).astype(np.int32)
-
-        inside_screen = (
-            (sx >= 0) &
-            (sx < small_w) &
-            (sy >= 0) &
-            (sy < small_h)
-        )
-
-        visible_arc_fraction = float(
-            np.mean(inside_screen)
-        )
-
-        if visible_arc_fraction < 0.50:
-            continue
-
-        # Larger circles are preferred only very slightly. Geometry,
-        # consistency and contrast remain the dominant signals.
-        size_quality = min(
-            1.0,
-            sr /
-            max(
-                float(HOUGH_MIN_RADIUS),
-                1.0
-            )
-        )
-
-        score = (
-            0.42 *
-            consistency
-            +
-            0.30 *
-            min(
-                background_contrast / 120.0,
-                1.0
-            )
-            +
-            0.18 *
-            min(
-                edge_strength / 80.0,
-                1.0
-            )
-            +
-            0.07 *
-            visible_arc_fraction
-            +
-            0.03 *
-            size_quality
-        )
-
-        # Never click a weak Hough candidate, even when it is the only
-        # geometric circle found in the frame.
-        if score < HOUGH_MIN_SCORE:
-            continue
-
-        if score <= best_score:
-            continue
-
-        actual_cx = int(
-            round(
-                scx /
-                HOUGH_SCALE
-            )
-        )
-
-        actual_cy = int(
-            round(
-                scy /
-                HOUGH_SCALE
-            )
-        )
-
-        actual_r = float(
-            sr /
-            HOUGH_SCALE
-        )
-
-        # Keep click point inside the captured client area. For the
-        # screenshot-style edge circle the true center is still visible;
-        # if a fit ever lands just outside, clamp only to the capture edge.
-        actual_cx = max(
-            0,
-            min(
-                W - 1,
-                actual_cx
-            )
-        )
-
-        actual_cy = max(
-            0,
-            min(
-                H - 1,
-                actual_cy
-            )
-        )
-
-        half = int(
-            round(
-                sr /
-                HOUGH_SCALE
-            )
-        )
-
-        x0 = max(
-            0,
-            actual_cx - half
-        )
-        y0 = max(
-            0,
-            actual_cy - half
-        )
-        x1 = min(
-            W - 1,
-            actual_cx + half
-        )
-        y1 = min(
-            H - 1,
-            actual_cy + half
-        )
-
-        best_score = score
-
-        best = {
-            "cx": actual_cx,
-            "cy": actual_cy,
-            "r": actual_r,
-            "bbox": (
-                x0,
-                y0,
-                max(1, x1 - x0 + 1),
-                max(1, y1 - y0 + 1)
-            ),
-            "area": float(
-                math.pi *
-                actual_r *
-                actual_r
-            ),
-            "score": float(score),
-            "circularity": 1.0,
-            "fill": 1.0,
-            "solidity": 1.0,
-            "edge": bool(
-                actual_cx - actual_r < 1
-                or
-                actual_cy - actual_r < 1
-                or
-                actual_cx + actual_r >= W - 1
-                or
-                actual_cy + actual_r >= H - 1
-            ),
-            "bgr": tuple(
-                int(v)
-                for v in frame[
-                    actual_cy,
-                    actual_cx
-                ]
-            ),
-            "fit_center": (
-                float(actual_cx),
-                float(actual_cy)
-            ),
-            "dt_center": (
-                float(actual_cx),
-                float(actual_cy)
-            ),
-            "dt_radius": float(actual_r),
-            "color_consistency": float(consistency),
-            "background_contrast": float(background_contrast),
-            "edge_strength": float(edge_strength),
-            "visible_arc_fraction": float(
-                visible_arc_fraction
-            )
-        }
-
-    return best
-
-
-def detect_circle(frame):
-    """
-    Strict screenshot-matched detector.
-
-    Only a strong Hough circle that also looks like a large, filled,
-    single-colour foreground object is accepted. No weak contour fallback
-    is used because an incorrect click is worse than waiting for a clearer
-    capture frame.
-    """
-    return detect_circle_hough(frame)
-
-
 def same_target(a, b):
     """
     Decide whether two detections are still the same physical circle.
@@ -1514,7 +1091,7 @@ def main():
     print("=" * 70)
     print("scrcpy title:", SCRCPY_TITLE)
     print("SPACE = auto click ON/OFF | R = reset stats | Q = quit")
-    print("[MODE] No ADB calls. Clicks use the normal Windows mouse path; cursor is restored after each click.")
+    print("[MODE] No ADB calls. Clicks are sent through the existing scrcpy window.")
 
     hwnd = find_scrcpy()
     if not hwnd:
@@ -1824,11 +1401,6 @@ def main():
                                      age, state)
 
                 total_fps = frame_count / max(time.perf_counter() - run_start, 1e-6)
-                color_consistency_display = (
-                    target.get("color_consistency", 0.0)
-                    if target is not None else 0.0
-                )
-
                 text_lines = [
                     f"STATE: {state}",
                     f"FPS: {total_fps:.1f}",
@@ -1837,7 +1409,10 @@ def main():
                     f"Tap dispatch: {last_dispatch:.2f} ms",
                     f"Detect->Tap: {last_dt_tap:.2f} ms",
                     f"Center clicks: {pending['clicks'] if pending is not None else 0}",
-                    f"Color consistency: {color_consistency_display:.2f}",
+                    f"Color consistency: {(
+                        target['color_consistency']
+                        if target is not None else 0.0
+                    ):.2f}",
                     f"Confirm: {last_confirm_reason}",
                     f"Targets: {detected_count}  Clicks: {click_count}",
                     f"Completed: {confirmed}  Tap failures: {failed}",
