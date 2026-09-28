@@ -31,13 +31,14 @@ HOUGH_SCALE = 0.50
 HOUGH_DP = 1.20
 HOUGH_PARAM1 = 85
 HOUGH_PARAM2 = 24
-HOUGH_MIN_RADIUS = 18          # radius in the downscaled image (~36 px actual)
+HOUGH_MIN_RADIUS = 35          # ~70 px actual; ignores tiny/random circles
 HOUGH_MAX_RADIUS_RATIO = 0.75  # allow a large circle clipped by an edge
-HOUGH_MIN_DIST = 35
+HOUGH_MIN_DIST = 45
+HOUGH_MIN_SCORE = 0.72
 
-MIN_TARGET_COLOR_CONSISTENCY = 0.78
+MIN_TARGET_COLOR_CONSISTENCY = 0.84
 TARGET_COLOR_DISTANCE = 24.0
-MIN_TARGET_BG_CONTRAST = 18.0
+MIN_TARGET_BG_CONTRAST = 80.0
 MIN_TARGET_EDGE_STRENGTH = 18.0
 MAX_RADIUS_RATIO = 0.48
 MIN_CIRCULARITY = 0.68
@@ -48,13 +49,9 @@ MIN_ASPECT = 0.60
 MAX_ASPECT = 1.67
 MORPH_K = 3
 
-# Reject candidates that are too colour-mixed to be the intended
-# single-colour target circle.
-MIN_COLOR_CONSISTENCY = 0.82
-COLOR_DISTANCE_THRESHOLD = 34.0
-
-# No fixed screen-position exclusion is used.
-# A valid target may appear anywhere on the scrcpy client area.
+# No fixed target position is assumed.
+# The detector is geometry/contrast driven so the circle may move around
+# the playable area, including close to an edge.
 
 # Keep clicking the detected center until the circle really disappears
 # from the scrcpy capture.
@@ -1116,12 +1113,12 @@ def detect_circle_hough(frame):
         )
 
         score = (
-            0.48 *
+            0.42 *
             consistency
             +
-            0.24 *
+            0.30 *
             min(
-                background_contrast / 100.0,
+                background_contrast / 120.0,
                 1.0
             )
             +
@@ -1137,6 +1134,11 @@ def detect_circle_hough(frame):
             0.03 *
             size_quality
         )
+
+        # Never click a weak Hough candidate, even when it is the only
+        # geometric circle found in the frame.
+        if score < HOUGH_MIN_SCORE:
+            continue
 
         if score <= best_score:
             continue
@@ -1262,18 +1264,14 @@ def detect_circle_hough(frame):
 
 def detect_circle(frame):
     """
-    Primary screenshot-matched detector with a conservative contour
-    fallback. The Hough detector is preferred because it handles large
-    edge-clipped circles directly.
+    Strict screenshot-matched detector.
+
+    Only a strong Hough circle that also looks like a large, filled,
+    single-colour foreground object is accepted. No weak contour fallback
+    is used because an incorrect click is worse than waiting for a clearer
+    capture frame.
     """
-    target = detect_circle_hough(frame)
-
-    if target is not None:
-        return target
-
-    # Fallback keeps the existing contour path available for unusual
-    # frames where the edge detector temporarily misses the circle.
-    return detect_circle_contour(frame)
+    return detect_circle_hough(frame)
 
 
 def same_target(a, b):
