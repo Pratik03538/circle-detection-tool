@@ -1009,7 +1009,6 @@ def main():
         move_output_window(cap.region)
 
     pending = None
-    blocked_target = None
     overlay_target = None
     overlay_time = 0.0
     last_region_update = 0.0
@@ -1298,7 +1297,7 @@ def main():
                     f"Detect: {last_det:.2f} ms",
                     f"Tap dispatch: {last_dispatch:.2f} ms",
                     f"Detect->Tap: {last_dt_tap:.2f} ms",
-                    f"Probe change: {last_change_mean:.1f} / {last_change_fraction * 100:.1f}%",
+                    f"Center clicks: {pending["clicks"] if pending is not None else 0}",
                     f"Confirm: {last_confirm_reason}",
                     f"Targets: {detected_count}  Clicks: {click_count}",
                     f"Completed: {confirmed}  Tap failures: {failed}",
@@ -1323,7 +1322,6 @@ def main():
                     run_start = time.perf_counter()
                     last_confirm_reason = "NONE"
                     pending = None
-                    blocked_target = None
                     print("[CONTROL] Stats reset")
 
     except KeyboardInterrupt:
