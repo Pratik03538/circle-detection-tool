@@ -39,10 +39,19 @@ FINISH_X = 0.58
 FINISH_Y = 0.18
 
 # After a click, the old target must disappear/change.
-CONFIRM_TIMEOUT_MS = 350
+CONFIRM_MIN_DELAY_MS = 25
+CONFIRM_TIMEOUT_MS = 1000
 ALLOW_RETRY = False
 RETRY_AFTER_MS = 180
 MAX_RETRIES = 1
+
+# A click is confirmed from the actual captured screen transition, not only
+# from target geometry. This prevents false confirmation failures when the
+# new target looks similar to the old one for a frame or two.
+CHANGE_PIXEL_DELTA = 18
+CHANGE_MEAN_THRESHOLD = 8.0
+CHANGE_FRACTION_THRESHOLD = 0.10
+PROBE_MARGIN_RATIO = 0.35
 
 OVERLAY_MS = 170
 REGION_REFRESH_SEC = 0.25
@@ -110,6 +119,31 @@ class Capture:
             "left": l, "top": t, "width": r - l, "height": b - t
         }))
         return cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+
+
+    def close(self):
+        # Deterministic DXCam/MSS cleanup.
+        if self.dx is not None:
+            try:
+                release = getattr(self.dx, "release", None)
+                if callable(release):
+                    release()
+                else:
+                    stop = getattr(self.dx, "stop", None)
+                    if callable(stop):
+                        stop()
+            except Exception:
+                pass
+            finally:
+                self.dx = None
+
+        if self.mss is not None:
+            try:
+                self.mss.close()
+            except Exception:
+                pass
+            finally:
+                self.mss = None
 
 
 class Tapper:
@@ -658,6 +692,89 @@ def detect_circle(frame):
 
     return best
 
+def make_click_probe(frame, target):
+    """
+    Save a small grayscale region around the target before the click.
+    Later frames are compared against this exact screen area.
+    """
+    H, W = frame.shape[:2]
+    cx = float(target["cx"])
+    cy = float(target["cy"])
+    r = max(float(target["r"]), float(MIN_RADIUS))
+
+    pad = max(6, int(round(r * PROBE_MARGIN_RATIO)))
+    half = max(8, int(round(r + pad)))
+
+    x0 = max(0, int(round(cx - half)))
+    y0 = max(0, int(round(cy - half)))
+    x1 = min(W, int(round(cx + half + 1)))
+    y1 = min(H, int(round(cy + half + 1)))
+
+    if x1 <= x0 or y1 <= y0:
+        return None
+
+    gray = cv2.cvtColor(
+        frame[y0:y1, x0:x1],
+        cv2.COLOR_BGR2GRAY
+    )
+
+    return {
+        "x0": x0,
+        "y0": y0,
+        "x1": x1,
+        "y1": y1,
+        "gray": gray.copy(),
+    }
+
+
+def probe_changed(frame, probe):
+    """
+    Return (changed, mean_abs_difference, changed_fraction).
+    The comparison uses raw capture frames before the debug overlay.
+    """
+    if probe is None:
+        return False, 0.0, 0.0
+
+    x0 = probe["x0"]
+    y0 = probe["y0"]
+    x1 = probe["x1"]
+    y1 = probe["y1"]
+
+    current = frame[y0:y1, x0:x1]
+
+    if current.size == 0:
+        return False, 0.0, 0.0
+
+    current_gray = cv2.cvtColor(
+        current,
+        cv2.COLOR_BGR2GRAY
+    )
+
+    reference = probe["gray"]
+
+    if current_gray.shape != reference.shape:
+        return False, 0.0, 0.0
+
+    diff = cv2.absdiff(
+        current_gray,
+        reference
+    )
+
+    mean_diff = float(np.mean(diff))
+    changed_fraction = float(
+        np.mean(diff >= CHANGE_PIXEL_DELTA)
+    )
+
+    changed = (
+        mean_diff >= CHANGE_MEAN_THRESHOLD
+        or
+        changed_fraction >= CHANGE_FRACTION_THRESHOLD
+    )
+
+    return changed, mean_diff, changed_fraction
+
+
+
 def same_target(a, b):
     d = math.hypot(a["cx"] - b["cx"], a["cy"] - b["cy"])
     rr = max(a["r"], b["r"], 1)
@@ -872,10 +989,13 @@ def main():
         move_output_window(cap.region)
 
     pending = None
+    blocked_target = None
     overlay_target = None
     overlay_time = 0.0
     last_region_update = 0.0
     last_cap = last_det = last_dispatch = last_dt_tap = 0.0
+    last_change_mean = 0.0
+    last_change_fraction = 0.0
     state = "WAITING"
     frame_count = detected_count = click_count = confirmed = failed = retries = 0
     cap_times, det_times, dispatch_times, dt_tap_times, confirm_times = [], [], [], [], []
@@ -913,29 +1033,55 @@ def main():
             det_times.append(last_det)
 
             # ==================================================
-            # WAITING: first valid target -> immediate tap
+            # WAITING: acquire a target unless the last timed-out
+            # target is still physically unchanged.
             # ==================================================
             if pending is None:
-                if target is not None:
+                if blocked_target is not None:
+                    if target is None or not same_target(target, blocked_target):
+                        blocked_target = None
+                        state = "TARGET CHANGED - REACQUIRE"
+                    else:
+                        state = "WAITING FOR TARGET CHANGE"
+
+                if pending is None and blocked_target is None and target is not None:
                     detected_count += 1
                     overlay_target = target
                     overlay_time = time.perf_counter()
+
                     click_x = region[0] + target["cx"]
                     click_y = region[1] + target["cy"]
+
                     if auto_click:
-                        dispatch_ms, ok = tapper.tap(click_x, click_y, hwnd)
+                        probe = make_click_probe(frame, target)
+
+                        dispatch_ms, ok = tapper.tap(
+                            click_x,
+                            click_y,
+                            hwnd
+                        )
+
                         click_sent = time.perf_counter()
                         last_dispatch = dispatch_ms
-                        last_dt_tap = (click_sent - overlay_time) * 1000
+                        last_dt_tap = (
+                            click_sent - overlay_time
+                        ) * 1000
+
                         if ok:
                             click_count += 1
                             dispatch_times.append(dispatch_ms)
                             dt_tap_times.append(last_dt_tap)
+
                             pending = {
-                                "target": target, "click_x": click_x, "click_y": click_y,
+                                "target": target,
+                                "click_x": click_x,
+                                "click_y": click_y,
                                 "detected_at": overlay_time,
-                                "click_at": click_sent, "retries": 0,
+                                "click_at": click_sent,
+                                "retries": 0,
+                                "probe": probe,
                             }
+
                             state = "CLICK SENT"
                         else:
                             state = "TAP FAILED"
@@ -943,57 +1089,125 @@ def main():
                         state = "DETECTED / CLICK OFF"
 
             # ==================================================
-            # AFTER CLICK: wait until old circle is gone/changed
+            # AFTER CLICK: confirm the physical screen transition.
             # ==================================================
             else:
-                age = (time.perf_counter() - pending["click_at"]) * 1000
-                old_same = target is not None and same_target(target, pending["target"])
+                age = (
+                    time.perf_counter() -
+                    pending["click_at"]
+                ) * 1000
 
-                if target is None or not old_same:
-                    confirm_ms = (time.perf_counter() - pending["detected_at"]) * 1000
+                target_changed = (
+                    target is None
+                    or
+                    not same_target(
+                        target,
+                        pending["target"]
+                    )
+                )
+
+                pixels_changed, change_mean, change_fraction = (
+                    probe_changed(
+                        frame,
+                        pending.get("probe")
+                    )
+                )
+
+                last_change_mean = change_mean
+                last_change_fraction = change_fraction
+
+                if (
+                    age >= CONFIRM_MIN_DELAY_MS
+                    and
+                    (target_changed or pixels_changed)
+                ):
+                    confirm_ms = (
+                        time.perf_counter() -
+                        pending["detected_at"]
+                    ) * 1000
+
                     confirmed += 1
                     confirm_times.append(confirm_ms)
+
                     pending = None
+                    blocked_target = None
                     state = "HIT CONFIRMED"
 
-                    # IMPORTANT: If the next circle is already in this same
-                    # frame, click it immediately; do not wait one more frame.
+                    # If the next target is already visible in this frame,
+                    # acquire/click it immediately without an extra frame.
                     if target is not None and auto_click:
                         detected_count += 1
                         overlay_target = target
                         overlay_time = time.perf_counter()
+
                         click_x = region[0] + target["cx"]
                         click_y = region[1] + target["cy"]
-                        dispatch_ms, ok = tapper.tap(click_x, click_y, hwnd)
+
+                        probe = make_click_probe(
+                            frame,
+                            target
+                        )
+
+                        dispatch_ms, ok = tapper.tap(
+                            click_x,
+                            click_y,
+                            hwnd
+                        )
+
                         click_sent = time.perf_counter()
                         last_dispatch = dispatch_ms
-                        last_dt_tap = (click_sent - overlay_time) * 1000
+                        last_dt_tap = (
+                            click_sent - overlay_time
+                        ) * 1000
+
                         if ok:
-                                click_count += 1
-                                dispatch_times.append(dispatch_ms)
-                                dt_tap_times.append(last_dt_tap)
-                                pending = {
-                                    "target": target, "click_x": click_x, "click_y": click_y,
-                                    "detected_at": overlay_time,
-                                    "click_at": click_sent, "retries": 0,
-                                }
-                                state = "CLICK SENT - NEXT TARGET"
+                            click_count += 1
+                            dispatch_times.append(dispatch_ms)
+                            dt_tap_times.append(last_dt_tap)
+
+                            pending = {
+                                "target": target,
+                                "click_x": click_x,
+                                "click_y": click_y,
+                                "detected_at": overlay_time,
+                                "click_at": click_sent,
+                                "retries": 0,
+                                "probe": probe,
+                            }
+
+                            state = "CLICK SENT - NEXT TARGET"
+                        else:
+                            state = "TAP FAILED - NEXT TARGET"
 
                 elif age >= CONFIRM_TIMEOUT_MS:
                     failed += 1
-                    if ALLOW_RETRY and pending["retries"] < MAX_RETRIES and age >= RETRY_AFTER_MS:
+                    blocked_target = pending["target"]
+
+                    if (
+                        ALLOW_RETRY
+                        and
+                        pending["retries"] < MAX_RETRIES
+                        and
+                        age >= RETRY_AFTER_MS
+                    ):
                         dispatch_ms, ok = tapper.tap(
-                            pending["click_x"], pending["click_y"], hwnd
+                            pending["click_x"],
+                            pending["click_y"],
+                            hwnd
                         )
+
                         pending["retries"] += 1
                         retries += 1
                         last_dispatch = dispatch_ms
                         state = "RETRY"
+
                         if ok:
-                            dispatch_times.append(dispatch_ms)
+                            dispatch_times.append(
+                                dispatch_ms
+                            )
                     else:
                         pending = None
-                        state = "CONFIRM TIMEOUT"
+                        state = "CONFIRM TIMEOUT - BLOCKED"
 
             # ==================================================
             # OUTPUT / VISUAL TEST OVERLAY
@@ -1014,6 +1228,7 @@ def main():
                     f"Detect: {last_det:.2f} ms",
                     f"Tap dispatch: {last_dispatch:.2f} ms",
                     f"Detect->Tap: {last_dt_tap:.2f} ms",
+                    f"Probe change: {last_change_mean:.1f} / {last_change_fraction * 100:.1f}%",
                     f"Targets: {detected_count}  Clicks: {click_count}",
                     f"Confirmed: {confirmed}  Failed: {failed}",
                 ]
@@ -1034,12 +1249,20 @@ def main():
                     frame_count = detected_count = click_count = confirmed = failed = retries = 0
                     cap_times.clear(); det_times.clear(); dispatch_times.clear(); dt_tap_times.clear(); confirm_times.clear()
                     run_start = time.perf_counter()
+                    last_change_mean = 0.0
+                    last_change_fraction = 0.0
+                    pending = None
+                    blocked_target = None
                     print("[CONTROL] Stats reset")
 
     except KeyboardInterrupt:
         pass
     finally:
         tapper.close()
+        try:
+            cap.close()
+        except Exception:
+            pass
         cv2.destroyAllWindows()
 
     elapsed = max(time.perf_counter() - run_start, 1e-6)
