@@ -1788,44 +1788,27 @@ def main():
 
                 # --------------------------------------------------
                 # Detector did not see the circle in this frame.
-                # Do NOT assume it is gone from one missed frame.
                 #
-                # Keep clicking the LAST KNOWN CENTER until the circle
-                # has been absent for GONE_CONFIRM_FRAMES consecutive
-                # captures.
+                # IMPORTANT:
+                # Never click blindly on the last known center here.
+                # A missed frame can happen exactly while the old circle
+                # is disappearing and BEFORE the next circle appears.
+                # Blind re-clicks were causing occasional taps before
+                # the new circle was actually visible.
+                #
+                # We still require GONE_CONFIRM_FRAMES consecutive misses
+                # before completing the old target, but there is ZERO tap
+                # dispatch while no real circle is currently visible.
                 # --------------------------------------------------
                 else:
                     pending["gone_frames"] += 1
 
-                    if pending["gone_frames"] < GONE_CONFIRM_FRAMES:
-                        if age_ms >= RECLICK_INTERVAL_MS:
-                            dispatch_ms, ok = tapper.tap(
-                                pending["click_x"],
-                                pending["click_y"],
-                                hwnd
-                            )
+                    state = (
+                        f"WAITING CIRCLE "
+                        f"({pending['gone_frames']}/{GONE_CONFIRM_FRAMES})"
+                    )
 
-                            pending["last_click_at"] = time.perf_counter()
-                            pending["clicks"] += 1
-                            last_dispatch = dispatch_ms
-                            last_dt_tap = (
-                                pending["last_click_at"] -
-                                overlay_time
-                            ) * 1000
-
-                            if ok:
-                                click_count += 1
-                                retries += 1
-                                dispatch_times.append(dispatch_ms)
-                                dt_tap_times.append(last_dt_tap)
-                                state = (
-                                    f"CLICK LAST CENTER "
-                                    f"({pending['gone_frames']}/{GONE_CONFIRM_FRAMES})"
-                                )
-                            else:
-                                failed += 1
-                                state = "TAP FAILED - LAST CENTER"
-                    else:
+                    if pending["gone_frames"] >= GONE_CONFIRM_FRAMES:
                         confirm_ms = (
                             time.perf_counter() -
                             pending["started_at"]
