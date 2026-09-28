@@ -22,9 +22,28 @@ DISPLAY_EVERY = 1
 # Detection
 MIN_VALUE = 65
 MIN_SATURATION = 0
-MIN_AREA = 180
-MIN_RADIUS = 8
+MIN_AREA = 900
+MIN_RADIUS = 24
 MAX_RADIUS_RATIO = 0.48
+
+# Screenshot-style target validation.
+# The target must be large enough, filled, internally uniform, and have a
+# strong circular boundary against the surrounding dark background.
+HOUGH_SCALE = 0.50
+HOUGH_DP = 1.20
+HOUGH_PARAM1 = 90
+HOUGH_PARAM2 = 28
+HOUGH_MIN_RADIUS = 24
+HOUGH_MAX_RADIUS_RATIO = 0.75
+HOUGH_MIN_DIST = 45
+
+TARGET_CONFIRM_FRAMES = 3
+CORE_COLOR_CONSISTENCY = 0.92
+CORE_COLOR_DISTANCE = 20.0
+CORE_GRAY_STD_MAX = 8.0
+CORE_EDGE_DENSITY_MAX = 0.012
+OUTER_CONTRAST_MIN = 25.0
+VISIBLE_ARC_MIN = 0.55
 MIN_CIRCULARITY = 0.68
 MIN_CIRCULARITY_EDGE = 0.42
 MIN_FILL = 0.52
@@ -338,9 +357,9 @@ def refine_center_from_mask(
     )
 
 
-def detect_circle(frame):
+def detect_circle_legacy(frame):
     """
-    Detect the random filled circle.
+    Legacy contour detector retained for reference/debug only.
 
     Properties supported:
       - arbitrary color
@@ -740,6 +759,505 @@ def detect_circle(frame):
 
     return best
 
+
+
+def detect_circle_hough(frame):
+    """
+    Strict detector for the actual challenge circles shown in the supplied
+    screenshots.
+
+    Accepted target:
+      * large filled circle
+      * one coherent interior colour
+      * clean interior (no object/text inside)
+      * strong boundary against the dark background
+      * can be partially clipped by a screen edge
+
+    It is deliberately colour-independent: the circle may change colour.
+    """
+    H, W = frame.shape[:2]
+
+    small_w = max(
+        1,
+        int(round(W * HOUGH_SCALE))
+    )
+    small_h = max(
+        1,
+        int(round(H * HOUGH_SCALE))
+    )
+
+    small = cv2.resize(
+        frame,
+        (small_w, small_h),
+        interpolation=cv2.INTER_AREA
+    )
+
+    gray = cv2.cvtColor(
+        small,
+        cv2.COLOR_BGR2GRAY
+    )
+
+    gray = cv2.GaussianBlur(
+        gray,
+        (9, 9),
+        1.4
+    )
+
+    max_radius = max(
+        HOUGH_MIN_RADIUS,
+        int(
+            round(
+                min(small_w, small_h) *
+                HOUGH_MAX_RADIUS_RATIO
+            )
+        )
+    )
+
+    circles = cv2.HoughCircles(
+        gray,
+        cv2.HOUGH_GRADIENT,
+        dp=HOUGH_DP,
+        minDist=HOUGH_MIN_DIST,
+        param1=HOUGH_PARAM1,
+        param2=HOUGH_PARAM2,
+        minRadius=HOUGH_MIN_RADIUS,
+        maxRadius=max_radius
+    )
+
+    if circles is None:
+        return None
+
+    edges = cv2.Canny(
+        gray,
+        40,
+        100
+    )
+
+    yy, xx = np.ogrid[
+        :small_h,
+        :small_w
+    ]
+
+    best = None
+    best_score = -1.0
+
+    for circle in np.round(
+        circles[0],
+        2
+    ):
+        scx, scy, sr = (
+            float(circle[0]),
+            float(circle[1]),
+            float(circle[2])
+        )
+
+        if not (
+            np.isfinite(scx) and
+            np.isfinite(scy) and
+            np.isfinite(sr)
+        ):
+            continue
+
+        if sr < HOUGH_MIN_RADIUS:
+            continue
+
+        rr = (
+            (xx - scx) ** 2 +
+            (yy - scy) ** 2
+        )
+
+        # Core is deliberately central. It must be a uniform filled area.
+        core = (
+            rr <=
+            (sr * 0.50) ** 2
+        )
+
+        # A slightly wider interior is used to make sure the target does
+        # not contain text/an object/another small circle.
+        inner = (
+            rr <=
+            (sr * 0.72) ** 2
+        )
+
+        # Outside ring is compared against the core colour.
+        outer_ring = (
+            (rr >= (sr * 1.04) ** 2) &
+            (rr <= (sr * 1.18) ** 2)
+        )
+
+        core_pixels = small[core]
+        inner_gray = gray[inner]
+        ring_pixels = small[outer_ring]
+
+        if (
+            len(core_pixels) < 100 or
+            len(ring_pixels) < 50
+        ):
+            continue
+
+        median_bgr = np.median(
+            core_pixels,
+            axis=0
+        ).astype(np.float32)
+
+        colour_distance = np.linalg.norm(
+            core_pixels.astype(np.float32) -
+            median_bgr,
+            axis=1
+        )
+
+        consistency = float(
+            np.mean(
+                colour_distance <=
+                CORE_COLOR_DISTANCE
+            )
+        )
+
+        if consistency < CORE_COLOR_CONSISTENCY:
+            continue
+
+        core_std = float(
+            np.std(
+                gray[core]
+            )
+        )
+
+        if core_std > CORE_GRAY_STD_MAX:
+            continue
+
+        # Any object/mark inside the circle creates internal edges.
+        core_edge_density = float(
+            np.mean(
+                edges[inner] > 0
+            )
+        )
+
+        if core_edge_density > CORE_EDGE_DENSITY_MAX:
+            continue
+
+        if len(ring_pixels) < 50:
+            continue
+
+        outer_median = np.median(
+            ring_pixels,
+            axis=0
+        ).astype(np.float32)
+
+        outer_contrast = float(
+            np.linalg.norm(
+                median_bgr -
+                outer_median
+            )
+        )
+
+        if outer_contrast < OUTER_CONTRAST_MIN:
+            continue
+
+        # Estimate how much of the circle circumference remains visible.
+        angles = np.linspace(
+            0.0,
+            2.0 * math.pi,
+            72,
+            endpoint=False
+        )
+
+        sx = np.rint(
+            scx +
+            sr *
+            np.cos(angles)
+        ).astype(np.int32)
+
+        sy = np.rint(
+            scy +
+            sr *
+            np.sin(angles)
+        ).astype(np.int32)
+
+        visible = (
+            (sx >= 0) &
+            (sx < small_w) &
+            (sy >= 0) &
+            (sy < small_h)
+        )
+
+        visible_arc = float(
+            np.mean(
+                visible
+            )
+        )
+
+        if visible_arc < VISIBLE_ARC_MIN:
+            continue
+
+        # Target centre must itself be on-screen because that is where
+        # the physical click will be delivered.
+        if not (
+            0 <= scx < small_w and
+            0 <= scy < small_h
+        ):
+            continue
+
+        # Small edge strength bonus: the target's perimeter should actually
+        # be visible, rather than being a smooth background patch.
+        circle_samples = 96
+        sample_angles = np.linspace(
+            0.0,
+            2.0 * math.pi,
+            circle_samples,
+            endpoint=False
+        )
+
+        ex = np.rint(
+            scx +
+            sr *
+            np.cos(sample_angles)
+        ).astype(np.int32)
+
+        ey = np.rint(
+            scy +
+            sr *
+            np.sin(sample_angles)
+        ).astype(np.int32)
+
+        valid_edge = (
+            (ex >= 0) &
+            (ex < small_w) &
+            (ey >= 0) &
+            (ey < small_h)
+        )
+
+        if np.any(valid_edge):
+            edge_strength = float(
+                np.mean(
+                    gradient_magnitude_at_points(
+                        gray,
+                        ex[valid_edge],
+                        ey[valid_edge]
+                    )
+                )
+            )
+        else:
+            edge_strength = 0.0
+
+        # Do not require a huge Sobel magnitude because the supplied
+        # screenshots have anti-aliased circle edges.
+        if edge_strength < 6.0:
+            continue
+
+        actual_cx = int(
+            round(
+                scx /
+                HOUGH_SCALE
+            )
+        )
+        actual_cy = int(
+            round(
+                scy /
+                HOUGH_SCALE
+            )
+        )
+        actual_r = float(
+            sr /
+            HOUGH_SCALE
+        )
+
+        actual_cx = max(
+            0,
+            min(
+                W - 1,
+                actual_cx
+            )
+        )
+        actual_cy = max(
+            0,
+            min(
+                H - 1,
+                actual_cy
+            )
+        )
+
+        x0 = max(
+            0,
+            int(
+                round(
+                    actual_cx -
+                    actual_r
+                )
+            )
+        )
+        y0 = max(
+            0,
+            int(
+                round(
+                    actual_cy -
+                    actual_r
+                )
+            )
+        )
+        x1 = min(
+            W - 1,
+            int(
+                round(
+                    actual_cx +
+                    actual_r
+                )
+            )
+        )
+        y1 = min(
+            H - 1,
+            int(
+                round(
+                    actual_cy +
+                    actual_r
+                )
+            )
+        )
+
+        # Score is mostly based on the target-specific properties.
+        score = (
+            0.45 *
+            consistency
+            +
+            0.25 *
+            min(
+                outer_contrast / 180.0,
+                1.0
+            )
+            +
+            0.15 *
+            visible_arc
+            +
+            0.10 *
+            min(
+                edge_strength / 60.0,
+                1.0
+            )
+            +
+            0.05 *
+            min(
+                sr / 40.0,
+                1.0
+            )
+        )
+
+        if score <= best_score:
+            continue
+
+        best_score = score
+
+        best = {
+            "cx": actual_cx,
+            "cy": actual_cy,
+            "r": max(
+                float(MIN_RADIUS),
+                actual_r
+            ),
+            "bbox": (
+                x0,
+                y0,
+                max(
+                    1,
+                    x1 - x0 + 1
+                ),
+                max(
+                    1,
+                    y1 - y0 + 1
+                )
+            ),
+            "area": float(
+                math.pi *
+                actual_r *
+                actual_r
+            ),
+            "score": float(score),
+            "circularity": 1.0,
+            "fill": 1.0,
+            "solidity": 1.0,
+            "edge": bool(
+                actual_cx - actual_r < 1
+                or
+                actual_cy - actual_r < 1
+                or
+                actual_cx + actual_r >= W - 1
+                or
+                actual_cy + actual_r >= H - 1
+            ),
+            "bgr": tuple(
+                int(v)
+                for v in frame[
+                    actual_cy,
+                    actual_cx
+                ]
+            ),
+            "fit_center": (
+                float(actual_cx),
+                float(actual_cy)
+            ),
+            "dt_center": (
+                float(actual_cx),
+                float(actual_cy)
+            ),
+            "dt_radius": float(actual_r),
+            "color_consistency": float(
+                consistency
+            ),
+            "core_gray_std": float(
+                core_std
+            ),
+            "core_edge_density": float(
+                core_edge_density
+            ),
+            "background_contrast": float(
+                outer_contrast
+            ),
+            "edge_strength": float(
+                edge_strength
+            ),
+            "visible_arc_fraction": float(
+                visible_arc
+            )
+        }
+
+    return best
+
+
+def gradient_magnitude_at_points(gray, xs, ys):
+    gx = cv2.Sobel(
+        gray,
+        cv2.CV_32F,
+        1,
+        0,
+        ksize=3
+    )
+    gy = cv2.Sobel(
+        gray,
+        cv2.CV_32F,
+        0,
+        1,
+        ksize=3
+    )
+
+    magnitude = cv2.magnitude(
+        gx,
+        gy
+    )
+
+    return magnitude[
+        ys,
+        xs
+    ]
+
+
+def detect_circle(frame):
+    """
+    Only accept a strict screenshot-style target.
+
+    There is intentionally no contour fallback: a missed frame waits,
+    whereas a false positive would cause an incorrect touch.
+    """
+    return detect_circle_hough(frame)
+
+
 def same_target(a, b):
     """
     Decide whether two detections are still the same physical circle.
@@ -980,7 +1498,7 @@ def main():
     print("=" * 70)
     print("scrcpy title:", SCRCPY_TITLE)
     print("SPACE = auto click ON/OFF | R = reset stats | Q = quit")
-    print("[MODE] No ADB calls. Clicks are sent through the existing scrcpy window.")
+    print("[MODE] Strict circle detection. No click until 3 consecutive frames confirm a real target.")
 
     hwnd = find_scrcpy()
     if not hwnd:
@@ -1009,6 +1527,8 @@ def main():
         move_output_window(cap.region)
 
     pending = None
+    candidate_target = None
+    candidate_streak = 0
     overlay_target = None
     overlay_time = 0.0
     last_region_update = 0.0
@@ -1063,50 +1583,92 @@ def main():
             #      consecutive captured frames.
             # ==================================================
             if pending is None:
-                if target is not None:
-                    detected_count += 1
+                # --------------------------------------------------
+                # WAIT FOR A REAL TARGET:
+                # The circle must be detected consistently in multiple
+                # consecutive frames before ANY click is allowed.
+                # --------------------------------------------------
+                if target is None:
+                    candidate_target = None
+                    candidate_streak = 0
+                    state = "WAITING FOR CIRCLE"
+
+                else:
+                    if (
+                        candidate_target is not None
+                        and
+                        same_target(
+                            target,
+                            candidate_target
+                        )
+                    ):
+                        candidate_streak += 1
+                    else:
+                        candidate_target = target
+                        candidate_streak = 1
 
                     overlay_target = target
                     overlay_time = time.perf_counter()
 
-                    (
-                        click_x,
-                        click_y,
-                        dispatch_ms,
-                        ok
-                    ) = click_target_center(
-                        target,
-                        region,
-                        hwnd,
-                        tapper
-                    )
+                    if candidate_streak < TARGET_CONFIRM_FRAMES:
+                        state = (
+                            f"CIRCLE CANDIDATE "
+                            f"{candidate_streak}/{TARGET_CONFIRM_FRAMES}"
+                        )
 
-                    click_sent = time.perf_counter()
-                    last_dispatch = dispatch_ms
-                    last_dt_tap = (
-                        click_sent - overlay_time
-                    ) * 1000
-
-                    if ok:
-                        click_count += 1
-                        dispatch_times.append(dispatch_ms)
-                        dt_tap_times.append(last_dt_tap)
-
-                        pending = {
-                            "target": target,
-                            "click_x": click_x,
-                            "click_y": click_y,
-                            "started_at": overlay_time,
-                            "last_click_at": click_sent,
-                            "clicks": 1,
-                            "gone_frames": 0,
-                        }
-
-                        last_confirm_reason = "CENTER CLICK"
-                        state = "CLICK CENTER"
                     else:
-                        failed += 1
-                        state = "TAP FAILED"
+                        (
+                            click_x,
+                            click_y,
+                            dispatch_ms,
+                            ok
+                        ) = click_target_center(
+                            target,
+                            region,
+                            hwnd,
+                            tapper
+                        )
+
+                        click_sent = time.perf_counter()
+                        last_dispatch = dispatch_ms
+                        last_dt_tap = (
+                            click_sent -
+                            overlay_time
+                        ) * 1000
+
+                        if ok:
+                            detected_count += 1
+                            click_count += 1
+                            dispatch_times.append(
+                                dispatch_ms
+                            )
+                            dt_tap_times.append(
+                                last_dt_tap
+                            )
+
+                            pending = {
+                                "target": target,
+                                "click_x": click_x,
+                                "click_y": click_y,
+                                "started_at": overlay_time,
+                                "last_click_at": click_sent,
+                                "clicks": 1,
+                                "gone_frames": 0,
+                            }
+
+                            candidate_target = None
+                            candidate_streak = 0
+
+                            last_confirm_reason = (
+                                "3-FRAME REAL CIRCLE"
+                            )
+                            state = "CLICK CENTER"
+
+                        else:
+                            failed += 1
+                            candidate_target = None
+                            candidate_streak = 0
+                            state = "TAP FAILED"
 
             else:
                 age_ms = (
@@ -1297,6 +1859,7 @@ def main():
                     f"Detect: {last_det:.2f} ms",
                     f"Tap dispatch: {last_dispatch:.2f} ms",
                     f"Detect->Tap: {last_dt_tap:.2f} ms",
+                    f"Candidate: {candidate_streak}/{TARGET_CONFIRM_FRAMES}",
                     f"Center clicks: {pending['clicks'] if pending is not None else 0}",
                     f"Confirm: {last_confirm_reason}",
                     f"Targets: {detected_count}  Clicks: {click_count}",
@@ -1322,6 +1885,8 @@ def main():
                     run_start = time.perf_counter()
                     last_confirm_reason = "NONE"
                     pending = None
+                    candidate_target = None
+                    candidate_streak = 0
                     print("[CONTROL] Stats reset")
 
     except KeyboardInterrupt:
