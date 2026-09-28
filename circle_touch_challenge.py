@@ -39,9 +39,9 @@ FINISH_X = 0.58
 FINISH_Y = 0.18
 
 # After a click, the old target must disappear/change.
-CONFIRM_MIN_DELAY_MS = 25
-CONFIRM_TIMEOUT_MS = 1000
-ALLOW_RETRY = False
+CONFIRM_MIN_DELAY_MS = 20
+CONFIRM_TIMEOUT_MS = 800
+ALLOW_RETRY = True
 RETRY_AFTER_MS = 180
 MAX_RETRIES = 1
 
@@ -147,21 +147,47 @@ class Capture:
 
 
 class Tapper:
-    """Send a real Windows click to the already-running scrcpy window.
-
-    This deliberately avoids adb completely, so it cannot restart the adb
-    server used by scrcpy and cannot disconnect an existing scrcpy session.
-    """
+    """Send reliable real mouse input to the existing scrcpy client."""
 
     def tap(self, x, y, hwnd):
         t0 = time.perf_counter()
+
         try:
-            # Make sure the click goes to scrcpy rather than the OpenCV window.
             user32.SetForegroundWindow(hwnd)
-            user32.SetCursorPos(int(x), int(y))
-            user32.mouse_event(0x0002, 0, 0, 0, 0)  # left down
-            user32.mouse_event(0x0004, 0, 0, 0, 0)  # left up
+
+            px = int(round(x))
+            py = int(round(y))
+
+            if not user32.SetCursorPos(px, py):
+                return (time.perf_counter() - t0) * 1000.0, False
+
+            inputs = (INPUT * 2)()
+
+            inputs[0].type = INPUT_MOUSE
+            inputs[0].mi = MOUSEINPUT(
+                0, 0, 0,
+                MOUSEEVENTF_LEFTDOWN,
+                0, 0
+            )
+
+            inputs[1].type = INPUT_MOUSE
+            inputs[1].mi = MOUSEINPUT(
+                0, 0, 0,
+                MOUSEEVENTF_LEFTUP,
+                0, 0
+            )
+
+            sent = user32.SendInput(
+                2,
+                inputs,
+                ctypes.sizeof(INPUT)
+            )
+
+            if sent != 2:
+                return (time.perf_counter() - t0) * 1000.0, False
+
             return (time.perf_counter() - t0) * 1000.0, True
+
         except Exception:
             return (time.perf_counter() - t0) * 1000.0, False
 
@@ -996,6 +1022,7 @@ def main():
     last_cap = last_det = last_dispatch = last_dt_tap = 0.0
     last_change_mean = 0.0
     last_change_fraction = 0.0
+    last_confirm_reason = "NONE"
     state = "WAITING"
     frame_count = detected_count = click_count = confirmed = failed = retries = 0
     cap_times, det_times, dispatch_times, dt_tap_times, confirm_times = [], [], [], [], []
@@ -1129,6 +1156,13 @@ def main():
                     confirmed += 1
                     confirm_times.append(confirm_ms)
 
+                    if target_changed and pixels_changed:
+                        last_confirm_reason = "TARGET+PIXELS"
+                    elif target_changed:
+                        last_confirm_reason = "TARGET"
+                    else:
+                        last_confirm_reason = "PIXELS"
+
                     pending = None
                     blocked_target = None
                     state = "HIT CONFIRMED"
@@ -1179,35 +1213,35 @@ def main():
                         else:
                             state = "TAP FAILED - NEXT TARGET"
 
+                elif (
+                    ALLOW_RETRY
+                    and
+                    pending["retries"] < MAX_RETRIES
+                    and
+                    age >= RETRY_AFTER_MS
+                    and
+                    not target_changed
+                ):
+                    dispatch_ms, ok = tapper.tap(
+                        pending["click_x"],
+                        pending["click_y"],
+                        hwnd
+                    )
+
+                    pending["retries"] += 1
+                    retries += 1
+                    last_dispatch = dispatch_ms
+                    state = "RETRY"
+
+                    if ok:
+                        dispatch_times.append(dispatch_ms)
+                        pending["click_at"] = time.perf_counter()
+
                 elif age >= CONFIRM_TIMEOUT_MS:
                     failed += 1
                     blocked_target = pending["target"]
-
-                    if (
-                        ALLOW_RETRY
-                        and
-                        pending["retries"] < MAX_RETRIES
-                        and
-                        age >= RETRY_AFTER_MS
-                    ):
-                        dispatch_ms, ok = tapper.tap(
-                            pending["click_x"],
-                            pending["click_y"],
-                            hwnd
-                        )
-
-                        pending["retries"] += 1
-                        retries += 1
-                        last_dispatch = dispatch_ms
-                        state = "RETRY"
-
-                        if ok:
-                            dispatch_times.append(
-                                dispatch_ms
-                            )
-                    else:
-                        pending = None
-                        state = "CONFIRM TIMEOUT - BLOCKED"
+                    pending = None
+                    state = "CONFIRM TIMEOUT - BLOCKED"
 
             # ==================================================
             # OUTPUT / VISUAL TEST OVERLAY
@@ -1229,6 +1263,7 @@ def main():
                     f"Tap dispatch: {last_dispatch:.2f} ms",
                     f"Detect->Tap: {last_dt_tap:.2f} ms",
                     f"Probe change: {last_change_mean:.1f} / {last_change_fraction * 100:.1f}%",
+                    f"Confirm by: {last_confirm_reason}",
                     f"Targets: {detected_count}  Clicks: {click_count}",
                     f"Confirmed: {confirmed}  Failed: {failed}",
                 ]
@@ -1251,6 +1286,7 @@ def main():
                     run_start = time.perf_counter()
                     last_change_mean = 0.0
                     last_change_fraction = 0.0
+                    last_confirm_reason = "NONE"
                     pending = None
                     blocked_target = None
                     print("[CONTROL] Stats reset")
