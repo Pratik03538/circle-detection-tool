@@ -1663,7 +1663,7 @@ def main():
     print("=" * 70)
     print("scrcpy title:", SCRCPY_TITLE)
     print("SPACE = auto click ON/OFF | R = reset stats | Q = quit")
-    print("[MODE] Strict circle detection. No click until 3 consecutive frames confirm a real target.")
+    print("[MODE] Strict circle detection + result-page Play Again handling.")
 
     hwnd = find_scrcpy()
     if not hwnd:
@@ -2201,6 +2201,7 @@ def main():
     print(f"Targets completed     : {confirmed}")
     print(f"Tap failures          : {failed}")
     print(f"Extra center clicks   : {retries}")
+    print(f"Play Again clicks     : {play_again_clicks}")
     print(f"Avg capture           : {avg(cap_times):.2f} ms")
     print(f"Avg OpenCV detection  : {avg(det_times):.2f} ms")
     print(f"Avg tap dispatch      : {avg(dispatch_times):.2f} ms")
