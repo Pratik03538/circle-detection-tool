@@ -22,8 +22,8 @@ DISPLAY_EVERY = 1
 # Detection
 MIN_VALUE = 65
 MIN_SATURATION = 0
-MIN_AREA = 450
-MIN_RADIUS = 12
+MIN_AREA = 180
+MIN_RADIUS = 8
 MAX_RADIUS_RATIO = 0.48
 MIN_CIRCULARITY = 0.68
 MIN_CIRCULARITY_EDGE = 0.42
@@ -32,11 +32,6 @@ MIN_SOLIDITY = 0.84
 MIN_ASPECT = 0.60
 MAX_ASPECT = 1.67
 MORPH_K = 3
-
-# Reject candidates that are too colour-mixed to be the intended
-# single-colour target circle.
-MIN_COLOR_CONSISTENCY = 0.82
-COLOR_DISTANCE_THRESHOLD = 34.0
 
 # The screenshots show a yellow Finish button at upper-right.
 # Only that common button area is ignored; circles elsewhere are allowed.
@@ -174,58 +169,49 @@ class Capture:
 
 
 class Tapper:
-    """
-    Send a click directly to the scrcpy window without moving the
-    real Windows cursor.
-
-    The cursor remains wherever the user leaves it.
-    """
-
-    WM_LBUTTONDOWN = 0x0201
-    WM_LBUTTONUP = 0x0202
-    MK_LBUTTON = 0x0001
-
-    @staticmethod
-    def _lparam(x, y):
-        # Client coordinates packed into the Windows mouse-message LPARAM.
-        return ctypes.c_uint32(
-            (int(y) << 16) | (int(x) & 0xFFFF)
-        ).value
+    """Send reliable real mouse input to the existing scrcpy client."""
 
     def tap(self, x, y, hwnd):
         t0 = time.perf_counter()
 
         try:
-            # hwnd receives client coordinates. No focus change and no
-            # SetCursorPos: the user's actual cursor is untouched.
-            lparam = self._lparam(x, y)
+            user32.SetForegroundWindow(hwnd)
 
-            down_ok = user32.PostMessageW(
-                hwnd,
-                self.WM_LBUTTONDOWN,
-                self.MK_LBUTTON,
-                lparam
+            px = int(round(x))
+            py = int(round(y))
+
+            if not user32.SetCursorPos(px, py):
+                return (time.perf_counter() - t0) * 1000.0, False
+
+            inputs = (INPUT * 2)()
+
+            inputs[0].type = INPUT_MOUSE
+            inputs[0].mi = MOUSEINPUT(
+                0, 0, 0,
+                MOUSEEVENTF_LEFTDOWN,
+                0, 0
             )
 
-            up_ok = user32.PostMessageW(
-                hwnd,
-                self.WM_LBUTTONUP,
-                0,
-                lparam
+            inputs[1].type = INPUT_MOUSE
+            inputs[1].mi = MOUSEINPUT(
+                0, 0, 0,
+                MOUSEEVENTF_LEFTUP,
+                0, 0
             )
 
-            ok = bool(down_ok and up_ok)
-
-            return (
-                (time.perf_counter() - t0) * 1000.0,
-                ok
+            sent = user32.SendInput(
+                2,
+                inputs,
+                ctypes.sizeof(INPUT)
             )
+
+            if sent != 2:
+                return (time.perf_counter() - t0) * 1000.0, False
+
+            return (time.perf_counter() - t0) * 1000.0, True
 
         except Exception:
-            return (
-                (time.perf_counter() - t0) * 1000.0,
-                False
-            )
+            return (time.perf_counter() - t0) * 1000.0, False
 
     def close(self):
         pass
@@ -352,84 +338,6 @@ def refine_center_from_mask(
     )
 
 
-def color_consistency(frame, contour, x, y, w, h):
-    """
-    Measure how close the interior pixels are to one dominant colour.
-
-    A normal target circle is usually one coherent colour. A collection
-    of many tiny circles or a multi-colour blob tends to have a much
-    lower consistency score.
-    """
-    roi = frame[y:y + h, x:x + w]
-
-    if roi.size == 0:
-        return 0.0
-
-    local_mask = np.zeros(
-        (h, w),
-        dtype=np.uint8
-    )
-
-    shifted = contour.copy()
-    shifted[:, 0, 0] -= x
-    shifted[:, 0, 1] -= y
-
-    cv2.fillPoly(
-        local_mask,
-        [shifted],
-        255
-    )
-
-    # Ignore the anti-aliased boundary so edge blending does not count
-    # as colour mixing.
-    kernel = np.ones(
-        (3, 3),
-        np.uint8
-    )
-
-    inner_mask = cv2.erode(
-        local_mask,
-        kernel,
-        iterations=1
-    )
-
-    ys, xs = np.where(inner_mask > 0)
-
-    if len(xs) < 25:
-        return 0.0
-
-    pixels = roi[ys, xs].astype(np.float32)
-
-    # Limit work on very large candidates while keeping samples uniform.
-    if len(pixels) > 2500:
-        idx = np.linspace(
-            0,
-            len(pixels) - 1,
-            2500
-        ).astype(np.int32)
-        pixels = pixels[idx]
-
-    median_bgr = np.median(
-        pixels,
-        axis=0
-    )
-
-    distances = np.sqrt(
-        np.sum(
-            (pixels - median_bgr) ** 2,
-            axis=1
-        )
-    )
-
-    consistent = float(
-        np.mean(
-            distances <= COLOR_DISTANCE_THRESHOLD
-        )
-    )
-
-    return consistent
-
-
 def detect_circle(frame):
     """
     Detect the random filled circle.
@@ -539,21 +447,6 @@ def detect_circle(frame):
         solidity = area / float(hull_area)
 
         if solidity < MIN_SOLIDITY:
-            continue
-
-        # ----------------------------------------------------
-        # Single-colour target validation.
-        # ----------------------------------------------------
-        colour_consistency = color_consistency(
-            frame,
-            contour,
-            x,
-            y,
-            w,
-            h
-        )
-
-        if colour_consistency < MIN_COLOR_CONSISTENCY:
             continue
 
         # ----------------------------------------------------
@@ -796,11 +689,8 @@ def detect_circle(frame):
                 1.0
             )
             +
-            0.12 *
+            0.20 *
             aspect_quality
-            +
-            0.08 *
-            colour_consistency
         )
 
         # A clean interior distance should be non-trivial.
@@ -835,7 +725,6 @@ def detect_circle(frame):
             "circularity": float(circularity),
             "fill": float(fill),
             "solidity": float(solidity),
-            "color_consistency": float(colour_consistency),
             "edge": bool(touches_edge),
             "bgr": center_bgr,
             "fit_center": (
@@ -1409,10 +1298,6 @@ def main():
                     f"Tap dispatch: {last_dispatch:.2f} ms",
                     f"Detect->Tap: {last_dt_tap:.2f} ms",
                     f"Center clicks: {pending['clicks'] if pending is not None else 0}",
-                    f"Color consistency: {(
-                        target['color_consistency']
-                        if target is not None else 0.0
-                    ):.2f}",
                     f"Confirm: {last_confirm_reason}",
                     f"Targets: {detected_count}  Clicks: {click_count}",
                     f"Completed: {confirmed}  Tap failures: {failed}",
