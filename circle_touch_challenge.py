@@ -173,53 +173,140 @@ class Capture:
 
 class Tapper:
     """
-    Send a click directly to the scrcpy window without moving the
-    real Windows cursor.
+    Send a real mouse click to scrcpy using Windows SendInput.
 
-    The cursor remains wherever the user leaves it.
+    The cursor is temporarily moved to the detected center, the click is
+    injected, and then the cursor is restored to the user's previous position.
     """
 
-    WM_LBUTTONDOWN = 0x0201
-    WM_LBUTTONUP = 0x0202
-    MK_LBUTTON = 0x0001
+    def _absolute_xy(self, x, y):
+        vx = user32.GetSystemMetrics(76)  # SM_XVIRTUALSCREEN
+        vy = user32.GetSystemMetrics(77)  # SM_YVIRTUALSCREEN
+        vw = user32.GetSystemMetrics(78)  # SM_CXVIRTUALSCREEN
+        vh = user32.GetSystemMetrics(79)  # SM_CYVIRTUALSCREEN
 
-    @staticmethod
-    def _lparam(x, y):
-        # Client coordinates packed into the Windows mouse-message LPARAM.
-        return ctypes.c_uint32(
-            (int(y) << 16) | (int(x) & 0xFFFF)
-        ).value
+        vw = max(1, vw)
+        vh = max(1, vh)
+
+        ax = int(
+            round(
+                (int(x) - vx) * 65535.0 / max(1, vw - 1)
+            )
+        )
+        ay = int(
+            round(
+                (int(y) - vy) * 65535.0 / max(1, vh - 1)
+            )
+        )
+
+        return (
+            max(0, min(65535, ax)),
+            max(0, min(65535, ay))
+        )
 
     def tap(self, x, y, hwnd):
         t0 = time.perf_counter()
 
+        old_point = wintypes.POINT()
+
         try:
-            # hwnd receives client coordinates. No focus change and no
-            # SetCursorPos: the user's actual cursor is untouched.
-            lparam = self._lparam(x, y)
+            if not user32.GetCursorPos(
+                ctypes.byref(old_point)
+            ):
+                return (
+                    (time.perf_counter() - t0) * 1000.0,
+                    False
+                )
 
-            down_ok = user32.PostMessageW(
-                hwnd,
-                self.WM_LBUTTONDOWN,
-                self.MK_LBUTTON,
-                lparam
+            # Activate scrcpy so the injected mouse event reaches it.
+            user32.SetForegroundWindow(hwnd)
+
+            target_x, target_y = self._absolute_xy(
+                x,
+                y
             )
 
-            up_ok = user32.PostMessageW(
-                hwnd,
-                self.WM_LBUTTONUP,
+            old_x, old_y = self._absolute_xy(
+                old_point.x,
+                old_point.y
+            )
+
+            # One ordered SendInput batch:
+            #   move -> left down -> left up -> restore cursor
+            inputs = (INPUT * 4)()
+
+            # Move to target.
+            inputs[0].type = INPUT_MOUSE
+            inputs[0].mi = MOUSEINPUT(
+                target_x,
+                target_y,
                 0,
-                lparam
+                0x0001 | 0x8000 | 0x4000,  # MOVE|ABSOLUTE|VIRTUALDESK
+                0,
+                0
             )
 
-            ok = bool(down_ok and up_ok)
+            # Left button down.
+            inputs[1].type = INPUT_MOUSE
+            inputs[1].mi = MOUSEINPUT(
+                0, 0, 0,
+                MOUSEEVENTF_LEFTDOWN,
+                0,
+                0
+            )
+
+            # Left button up.
+            inputs[2].type = INPUT_MOUSE
+            inputs[2].mi = MOUSEINPUT(
+                0, 0, 0,
+                MOUSEEVENTF_LEFTUP,
+                0,
+                0
+            )
+
+            # Restore the user's cursor position.
+            inputs[3].type = INPUT_MOUSE
+            inputs[3].mi = MOUSEINPUT(
+                old_x,
+                old_y,
+                0,
+                0x0001 | 0x8000 | 0x4000,  # MOVE|ABSOLUTE|VIRTUALDESK
+                0,
+                0
+            )
+
+            sent = user32.SendInput(
+                4,
+                inputs,
+                ctypes.sizeof(INPUT)
+            )
+
+            if sent != 4:
+                # Best-effort synchronous restoration in case the batch
+                # could not be fully injected.
+                user32.SetCursorPos(
+                    old_point.x,
+                    old_point.y
+                )
+                return (
+                    (time.perf_counter() - t0) * 1000.0,
+                    False
+                )
 
             return (
                 (time.perf_counter() - t0) * 1000.0,
-                ok
+                True
             )
 
         except Exception:
+            try:
+                user32.SetCursorPos(
+                    old_point.x,
+                    old_point.y
+                )
+            except Exception:
+                pass
+
             return (
                 (time.perf_counter() - t0) * 1000.0,
                 False
@@ -1085,7 +1172,7 @@ def main():
     print("=" * 70)
     print("scrcpy title:", SCRCPY_TITLE)
     print("SPACE = auto click ON/OFF | R = reset stats | Q = quit")
-    print("[MODE] No ADB calls. Clicks are sent through the existing scrcpy window.")
+    print("[MODE] No ADB calls. Clicks use Windows SendInput; cursor is restored after each click.")
 
     hwnd = find_scrcpy()
     if not hwnd:
