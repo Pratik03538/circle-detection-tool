@@ -17,7 +17,7 @@ OUTPUT_TITLE = "CIRCLE TOUCH - TEST OUTPUT"
 
 AUTO_CLICK_START = True
 SHOW_OUTPUT = True
-DISPLAY_EVERY = 1
+DISPLAY_EVERY = 2
 
 # Detection
 MIN_VALUE = 65
@@ -68,6 +68,10 @@ GONE_CONFIRM_FRAMES = 3
 PLAY_AGAIN_CONFIRM_FRAMES = 2
 PLAY_AGAIN_GONE_CONFIRM_FRAMES = 3
 PLAY_AGAIN_RECLICK_INTERVAL_MS = 120
+
+# Page detection is deliberately throttled: scanning the result-page button
+# every captured frame was unnecessary CPU work and could make scrcpy sluggish.
+PLAY_AGAIN_SCAN_INTERVAL_MS = 80
 
 PLAY_AGAIN_X_MIN = 0.48
 PLAY_AGAIN_Y_MIN = 0.80
@@ -276,12 +280,12 @@ def ignored_finish(x, y, w, h, W, H):
 
 def detect_play_again_page(frame):
     """
-    Detect the supplied end/result page from its distinctive lower-right
-    yellow rounded "Play again" button.
+    Fast result-page detector for the supplied lower-right yellow
+    "Play again" button.
 
-    This detector is intentionally position/shape constrained so a normal
-    yellow circle target during the game is not treated as the result page.
-    Returns the button center/bbox when the page is visible, otherwise None.
+    Only a small lower-right ROI is inspected, and it is downscaled before
+    HSV thresholding. This keeps the page check cheap enough that it does not
+    compete with scrcpy for CPU time.
     """
     H, W = frame.shape[:2]
 
@@ -292,28 +296,45 @@ def detect_play_again_page(frame):
     if roi.size == 0:
         return None
 
-    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    # Downsample only for page detection. We do not use this image for the
+    # actual click coordinate; the returned center is converted back.
+    scale = 0.35
+    rw = max(1, int(round(roi.shape[1] * scale)))
+    rh = max(1, int(round(roi.shape[0] * scale)))
 
-    lower = np.array([
-        PLAY_AGAIN_H_MIN_DEG,
-        PLAY_AGAIN_S_MIN,
-        PLAY_AGAIN_V_MIN
-    ], dtype=np.uint8)
+    small = cv2.resize(
+        roi,
+        (rw, rh),
+        interpolation=cv2.INTER_AREA
+    )
 
-    upper = np.array([
-        PLAY_AGAIN_H_MAX_DEG,
-        255,
-        255
-    ], dtype=np.uint8)
+    hsv = cv2.cvtColor(
+        small,
+        cv2.COLOR_BGR2HSV
+    )
 
-    mask = cv2.inRange(hsv, lower, upper)
+    lower = np.array(
+        [PLAY_AGAIN_H_MIN_DEG, PLAY_AGAIN_S_MIN, PLAY_AGAIN_V_MIN],
+        dtype=np.uint8
+    )
+    upper = np.array(
+        [PLAY_AGAIN_H_MAX_DEG, 255, 255],
+        dtype=np.uint8
+    )
 
-    k = np.ones((5, 5), np.uint8)
+    mask = cv2.inRange(
+        hsv,
+        lower,
+        upper
+    )
+
+    # One cheap close removes small holes from the rounded button highlight.
+    kernel = np.ones((3, 3), np.uint8)
     mask = cv2.morphologyEx(
         mask,
         cv2.MORPH_CLOSE,
-        k,
-        iterations=2
+        kernel,
+        iterations=1
     )
 
     contours, _ = cv2.findContours(
@@ -322,7 +343,8 @@ def detect_play_again_page(frame):
         cv2.CHAIN_APPROX_SIMPLE
     )
 
-    min_area = float(W * H) * PLAY_AGAIN_AREA_RATIO_MIN
+    min_area = float(rw * rh) * (PLAY_AGAIN_AREA_RATIO_MIN * 0.35)
+
     best = None
     best_score = -1.0
 
@@ -333,19 +355,13 @@ def detect_play_again_page(frame):
 
         x, y, w, h = cv2.boundingRect(contour)
 
-        abs_x = x0 + x
-        abs_y = y0 + y
-
-        if abs_x < int(W * PLAY_AGAIN_X_MIN):
+        if w < int(round(PLAY_AGAIN_W_MIN * rw * 0.75)):
             continue
-        if abs_y < int(H * PLAY_AGAIN_Y_MIN):
-            continue
-        if w < int(W * PLAY_AGAIN_W_MIN):
-            continue
-        if h < int(H * PLAY_AGAIN_H_MIN):
+        if h < max(4, int(round(PLAY_AGAIN_H_MIN * rh * 0.50))):
             continue
 
         aspect = w / float(max(h, 1))
+
         if not (
             PLAY_AGAIN_ASPECT_MIN
             <= aspect
@@ -353,25 +369,20 @@ def detect_play_again_page(frame):
         ):
             continue
 
-        area_ratio = area / float(max(w * h, 1))
-        if area_ratio < 0.50:
+        fill = area / float(max(w * h, 1))
+        if fill < 0.45:
             continue
 
-        # The button is a broad rounded rectangle, not a circle.
-        shape_quality = max(
-            0.0,
-            1.0 - abs(aspect - 2.5) / 2.5
-        )
-
-        size_quality = min(
-            1.0,
-            area / float(max(min_area * 2.0, 1.0))
-        )
+        # Require the candidate to occupy a broad part of this ROI.
+        # This separates the large result-page button from small yellow UI.
+        width_ratio = w / float(max(rw, 1))
+        if width_ratio < 0.38:
+            continue
 
         score = (
-            0.65 * area_ratio
-            + 0.35 * shape_quality
-            + 0.10 * size_quality
+            0.50 * min(fill, 1.0)
+            + 0.30 * min(width_ratio / 0.75, 1.0)
+            + 0.20 * (1.0 - min(abs(aspect - 2.5) / 2.5, 1.0))
         )
 
         if score <= best_score:
@@ -379,17 +390,23 @@ def detect_play_again_page(frame):
 
         best_score = score
 
-        center_x = abs_x + int(round(w * 0.50))
-        center_y = abs_y + int(round(h * 0.50))
+        # Convert the downscaled ROI coordinates back to full-frame coords.
+        center_x = x0 + int(round((x + w * 0.50) / scale))
+        center_y = y0 + int(round((y + h * 0.50) / scale))
+
+        full_x = x0 + int(round(x / scale))
+        full_y = y0 + int(round(y / scale))
+        full_w = max(1, int(round(w / scale)))
+        full_h = max(1, int(round(h / scale)))
 
         best = {
-            "cx": int(center_x),
-            "cy": int(center_y),
-            "bbox": (abs_x, abs_y, w, h),
-            "area": float(area),
+            "cx": int(max(0, min(W - 1, center_x))),
+            "cy": int(max(0, min(H - 1, center_y))),
+            "bbox": (full_x, full_y, full_w, full_h),
+            "area": float(area / (scale * scale)),
             "score": float(score),
             "aspect": float(aspect),
-            "area_ratio": float(area_ratio),
+            "area_ratio": float(fill),
         }
 
     return best
@@ -1704,6 +1721,10 @@ def main():
     play_again_last_click_at = 0.0
     play_again_clicks = 0
 
+    # Cached result-page detection to reduce per-frame CPU load.
+    last_play_again_scan_at = 0.0
+    cached_play_again = None
+
     overlay_target = None
     overlay_time = 0.0
     last_region_update = 0.0
@@ -1752,10 +1773,24 @@ def main():
             # This completely prevents the trophy/buttons/text on the
             # result page from being interpreted as circle targets.
             # ==================================================
-            page_t0 = time.perf_counter()
-            play_again = detect_play_again_page(frame)
-            page_det_ms = (time.perf_counter() - page_t0) * 1000.0
+            # Do not run the relatively expensive page detector on every
+            # captured frame. Once per 80 ms is fast enough for the result
+            # page, while keeping the circle detector responsive.
+            page_now = time.perf_counter()
+            if (
+                page_now - last_play_again_scan_at
+                >= PLAY_AGAIN_SCAN_INTERVAL_MS / 1000.0
+            ):
+                page_t0 = page_now
+                cached_play_again = detect_play_again_page(frame)
+                page_det_ms = (
+                    time.perf_counter() - page_t0
+                ) * 1000.0
+                last_play_again_scan_at = time.perf_counter()
+            else:
+                page_det_ms = 0.0
 
+            play_again = cached_play_again
             target = None
 
             if play_again is not None:
@@ -1849,6 +1884,8 @@ def main():
                     else:
                         play_again_active = False
                         play_again_target = None
+                        cached_play_again = None
+                        last_play_again_scan_at = 0.0
                         play_again_candidate_streak = 0
                         play_again_gone_frames = 0
                         play_again_last_click_at = 0.0
@@ -2178,6 +2215,8 @@ def main():
                     play_again_gone_frames = 0
                     play_again_last_click_at = 0.0
                     play_again_clicks = 0
+                    last_play_again_scan_at = 0.0
+                    cached_play_again = None
                     print("[CONTROL] Stats reset")
 
     except KeyboardInterrupt:
