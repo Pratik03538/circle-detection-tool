@@ -74,37 +74,6 @@ except Exception:
 
 user32 = ctypes.windll.user32
 
-ULONG_PTR = getattr(wintypes, "ULONG_PTR", ctypes.c_size_t)
-
-
-class MOUSEINPUT(ctypes.Structure):
-    _fields_ = [
-        ("dx", wintypes.LONG),
-        ("dy", wintypes.LONG),
-        ("mouseData", wintypes.DWORD),
-        ("dwFlags", wintypes.DWORD),
-        ("time", wintypes.DWORD),
-        ("dwExtraInfo", ULONG_PTR),
-    ]
-
-
-class INPUT(ctypes.Structure):
-    _fields_ = [
-        ("type", wintypes.DWORD),
-        ("mi", MOUSEINPUT),
-    ]
-
-
-INPUT_MOUSE = 0
-MOUSEEVENTF_LEFTDOWN = 0x0002
-MOUSEEVENTF_LEFTUP = 0x0004
-
-user32.SendInput.argtypes = [
-    wintypes.UINT,
-    ctypes.POINTER(INPUT),
-    ctypes.c_int,
-]
-user32.SendInput.restype = wintypes.UINT
 
 
 def find_scrcpy():
@@ -188,36 +157,12 @@ class Capture:
 
 class Tapper:
     """
-    Send a real mouse click to scrcpy using Windows SendInput.
+    Click the existing scrcpy window using the same Windows mouse path as a
+    normal manual click.
 
-    The cursor is temporarily moved to the detected center, the click is
-    injected, and then the cursor is restored to the user's previous position.
+    The real cursor is saved and restored immediately after LEFT DOWN/UP,
+    so it does not remain on the target.
     """
-
-    def _absolute_xy(self, x, y):
-        vx = user32.GetSystemMetrics(76)  # SM_XVIRTUALSCREEN
-        vy = user32.GetSystemMetrics(77)  # SM_YVIRTUALSCREEN
-        vw = user32.GetSystemMetrics(78)  # SM_CXVIRTUALSCREEN
-        vh = user32.GetSystemMetrics(79)  # SM_CYVIRTUALSCREEN
-
-        vw = max(1, vw)
-        vh = max(1, vh)
-
-        ax = int(
-            round(
-                (int(x) - vx) * 65535.0 / max(1, vw - 1)
-            )
-        )
-        ay = int(
-            round(
-                (int(y) - vy) * 65535.0 / max(1, vh - 1)
-            )
-        )
-
-        return (
-            max(0, min(65535, ax)),
-            max(0, min(65535, ay))
-        )
 
     def tap(self, x, y, hwnd):
         t0 = time.perf_counter()
@@ -233,80 +178,62 @@ class Tapper:
                     False
                 )
 
-            # Activate scrcpy so the injected mouse event reaches it.
-            user32.SetForegroundWindow(hwnd)
+            px = int(round(x))
+            py = int(round(y))
 
-            target_x, target_y = self._absolute_xy(
-                x,
-                y
-            )
+            # Safety: never inject outside the actual scrcpy client area.
+            region = client_region(hwnd)
 
-            old_x, old_y = self._absolute_xy(
-                old_point.x,
-                old_point.y
-            )
-
-            # One ordered SendInput batch:
-            #   move -> left down -> left up -> restore cursor
-            inputs = (INPUT * 4)()
-
-            # Move to target.
-            inputs[0].type = INPUT_MOUSE
-            inputs[0].mi = MOUSEINPUT(
-                target_x,
-                target_y,
-                0,
-                0x0001 | 0x8000 | 0x4000,  # MOVE|ABSOLUTE|VIRTUALDESK
-                0,
-                0
-            )
-
-            # Left button down.
-            inputs[1].type = INPUT_MOUSE
-            inputs[1].mi = MOUSEINPUT(
-                0, 0, 0,
-                MOUSEEVENTF_LEFTDOWN,
-                0,
-                0
-            )
-
-            # Left button up.
-            inputs[2].type = INPUT_MOUSE
-            inputs[2].mi = MOUSEINPUT(
-                0, 0, 0,
-                MOUSEEVENTF_LEFTUP,
-                0,
-                0
-            )
-
-            # Restore the user's cursor position.
-            inputs[3].type = INPUT_MOUSE
-            inputs[3].mi = MOUSEINPUT(
-                old_x,
-                old_y,
-                0,
-                0x0001 | 0x8000 | 0x4000,  # MOVE|ABSOLUTE|VIRTUALDESK
-                0,
-                0
-            )
-
-            sent = user32.SendInput(
-                4,
-                inputs,
-                ctypes.sizeof(INPUT)
-            )
-
-            if sent != 4:
-                # Best-effort synchronous restoration in case the batch
-                # could not be fully injected.
-                user32.SetCursorPos(
-                    old_point.x,
-                    old_point.y
-                )
+            if region is None:
                 return (
                     (time.perf_counter() - t0) * 1000.0,
                     False
                 )
+
+            left, top, right, bottom = region
+
+            if not (
+                left <= px < right
+                and
+                top <= py < bottom
+            ):
+                return (
+                    (time.perf_counter() - t0) * 1000.0,
+                    False
+                )
+
+            # Put the input target on scrcpy exactly as in a normal manual
+            # mouse interaction.
+            user32.SetForegroundWindow(hwnd)
+
+            if not user32.SetCursorPos(px, py):
+                return (
+                    (time.perf_counter() - t0) * 1000.0,
+                    False
+                )
+
+            user32.mouse_event(
+                MOUSEEVENTF_LEFTDOWN,
+                0,
+                0,
+                0,
+                0
+            )
+
+            user32.mouse_event(
+                MOUSEEVENTF_LEFTUP,
+                0,
+                0,
+                0,
+                0
+            )
+
+            # Restore the user's cursor immediately. The actual mouse
+            # down/up has already been delivered synchronously.
+            user32.SetCursorPos(
+                old_point.x,
+                old_point.y
+            )
 
             return (
                 (time.perf_counter() - t0) * 1000.0,
@@ -1096,6 +1023,23 @@ def detect_circle_hough(frame):
         if consistency < MIN_TARGET_COLOR_CONSISTENCY:
             continue
 
+        # The exact center of a filled circle should resemble the dominant
+        # interior colour. This rejects many Hough detections on text/edges.
+        center_bgr_small = small[
+            max(0, min(small_h - 1, int(round(scy)))),
+            max(0, min(small_w - 1, int(round(scx))))
+        ].astype(np.float32)
+
+        center_distance = float(
+            np.linalg.norm(
+                center_bgr_small -
+                median_bgr.astype(np.float32)
+            )
+        )
+
+        if center_distance > TARGET_COLOR_DISTANCE * 1.5:
+            continue
+
         ring_median = np.median(
             ring_pixels,
             axis=0
@@ -1572,7 +1516,7 @@ def main():
     print("=" * 70)
     print("scrcpy title:", SCRCPY_TITLE)
     print("SPACE = auto click ON/OFF | R = reset stats | Q = quit")
-    print("[MODE] No ADB calls. Clicks use Windows SendInput; cursor is restored after each click.")
+    print("[MODE] No ADB calls. Clicks use the normal Windows mouse path; cursor is restored after each click.")
 
     hwnd = find_scrcpy()
     if not hwnd:
