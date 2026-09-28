@@ -38,10 +38,8 @@ MORPH_K = 3
 MIN_COLOR_CONSISTENCY = 0.82
 COLOR_DISTANCE_THRESHOLD = 34.0
 
-# The screenshots show a yellow Finish button at upper-right.
-# Only that common button area is ignored; circles elsewhere are allowed.
-FINISH_X = 0.58
-FINISH_Y = 0.18
+# No fixed screen-position exclusion is used.
+# A valid target may appear anywhere on the scrcpy client area.
 
 # Keep clicking the detected center until the circle really disappears
 # from the scrcpy capture.
@@ -244,10 +242,6 @@ def target_mask(frame):
 # Backward-compatible name used by the detector.
 def make_target_mask(frame):
     return target_mask(frame)
-
-
-def ignored_finish(x, y, w, h, W, H):
-    return x >= int(W * FINISH_X) and y <= int(H * FINISH_Y)
 
 
 def fit_circle_least_squares(contour):
@@ -1410,7 +1404,7 @@ def main():
                     f"Detect->Tap: {last_dt_tap:.2f} ms",
                     f"Center clicks: {pending['clicks'] if pending is not None else 0}",
                     f"Color consistency: {(
-                        target['color_consistency']
+                        target.get('color_consistency', 0.0)
                         if target is not None else 0.0
                     ):.2f}",
                     f"Confirm: {last_confirm_reason}",
