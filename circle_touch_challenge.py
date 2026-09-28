@@ -1297,7 +1297,7 @@ def main():
                     f"Detect: {last_det:.2f} ms",
                     f"Tap dispatch: {last_dispatch:.2f} ms",
                     f"Detect->Tap: {last_dt_tap:.2f} ms",
-                    f"Center clicks: {pending["clicks"] if pending is not None else 0}",
+                    f"Center clicks: {pending['clicks'] if pending is not None else 0}",
                     f"Confirm: {last_confirm_reason}",
                     f"Targets: {detected_count}  Clicks: {click_count}",
                     f"Completed: {confirmed}  Tap failures: {failed}",
