@@ -17,7 +17,7 @@ OUTPUT_TITLE = "CIRCLE TOUCH - TEST OUTPUT"
 
 AUTO_CLICK_START = True
 SHOW_OUTPUT = True
-DISPLAY_EVERY = 2
+DISPLAY_EVERY = 1
 
 # Detection
 MIN_VALUE = 65
@@ -61,29 +61,6 @@ FINISH_Y = 0.18
 # from the scrcpy capture.
 RECLICK_INTERVAL_MS = 40
 GONE_CONFIRM_FRAMES = 3
-
-# End-of-game / result page handling.
-# The supplied result-page screenshot has a large yellow rounded
-# "Play again" button in the lower-right area.
-PLAY_AGAIN_CONFIRM_FRAMES = 2
-PLAY_AGAIN_GONE_CONFIRM_FRAMES = 3
-PLAY_AGAIN_RECLICK_INTERVAL_MS = 120
-
-# Page detection is deliberately throttled: scanning the result-page button
-# every captured frame was unnecessary CPU work and could make scrcpy sluggish.
-PLAY_AGAIN_SCAN_INTERVAL_MS = 80
-
-PLAY_AGAIN_X_MIN = 0.48
-PLAY_AGAIN_Y_MIN = 0.80
-PLAY_AGAIN_W_MIN = 0.28
-PLAY_AGAIN_H_MIN = 0.055
-PLAY_AGAIN_ASPECT_MIN = 1.90
-PLAY_AGAIN_ASPECT_MAX = 3.50
-PLAY_AGAIN_AREA_RATIO_MIN = 0.006
-PLAY_AGAIN_H_MIN_DEG = 18
-PLAY_AGAIN_H_MAX_DEG = 42
-PLAY_AGAIN_S_MIN = 80
-PLAY_AGAIN_V_MIN = 140
 
 OVERLAY_MS = 170
 REGION_REFRESH_SEC = 0.25
@@ -276,140 +253,6 @@ def make_target_mask(frame):
 
 def ignored_finish(x, y, w, h, W, H):
     return x >= int(W * FINISH_X) and y <= int(H * FINISH_Y)
-
-
-def detect_play_again_page(frame):
-    """
-    Fast result-page detector for the supplied lower-right yellow
-    "Play again" button.
-
-    Only a small lower-right ROI is inspected, and it is downscaled before
-    HSV thresholding. This keeps the page check cheap enough that it does not
-    compete with scrcpy for CPU time.
-    """
-    H, W = frame.shape[:2]
-
-    x0 = int(W * PLAY_AGAIN_X_MIN)
-    y0 = int(H * PLAY_AGAIN_Y_MIN)
-
-    roi = frame[y0:H, x0:W]
-    if roi.size == 0:
-        return None
-
-    # Downsample only for page detection. We do not use this image for the
-    # actual click coordinate; the returned center is converted back.
-    scale = 0.35
-    rw = max(1, int(round(roi.shape[1] * scale)))
-    rh = max(1, int(round(roi.shape[0] * scale)))
-
-    small = cv2.resize(
-        roi,
-        (rw, rh),
-        interpolation=cv2.INTER_AREA
-    )
-
-    hsv = cv2.cvtColor(
-        small,
-        cv2.COLOR_BGR2HSV
-    )
-
-    lower = np.array(
-        [PLAY_AGAIN_H_MIN_DEG, PLAY_AGAIN_S_MIN, PLAY_AGAIN_V_MIN],
-        dtype=np.uint8
-    )
-    upper = np.array(
-        [PLAY_AGAIN_H_MAX_DEG, 255, 255],
-        dtype=np.uint8
-    )
-
-    mask = cv2.inRange(
-        hsv,
-        lower,
-        upper
-    )
-
-    # One cheap close removes small holes from the rounded button highlight.
-    kernel = np.ones((3, 3), np.uint8)
-    mask = cv2.morphologyEx(
-        mask,
-        cv2.MORPH_CLOSE,
-        kernel,
-        iterations=1
-    )
-
-    contours, _ = cv2.findContours(
-        mask,
-        cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_SIMPLE
-    )
-
-    min_area = float(rw * rh) * (PLAY_AGAIN_AREA_RATIO_MIN * 0.35)
-
-    best = None
-    best_score = -1.0
-
-    for contour in contours:
-        area = cv2.contourArea(contour)
-        if area < min_area:
-            continue
-
-        x, y, w, h = cv2.boundingRect(contour)
-
-        if w < int(round(PLAY_AGAIN_W_MIN * rw * 0.75)):
-            continue
-        if h < max(4, int(round(PLAY_AGAIN_H_MIN * rh * 0.50))):
-            continue
-
-        aspect = w / float(max(h, 1))
-
-        if not (
-            PLAY_AGAIN_ASPECT_MIN
-            <= aspect
-            <= PLAY_AGAIN_ASPECT_MAX
-        ):
-            continue
-
-        fill = area / float(max(w * h, 1))
-        if fill < 0.45:
-            continue
-
-        # Require the candidate to occupy a broad part of this ROI.
-        # This separates the large result-page button from small yellow UI.
-        width_ratio = w / float(max(rw, 1))
-        if width_ratio < 0.38:
-            continue
-
-        score = (
-            0.50 * min(fill, 1.0)
-            + 0.30 * min(width_ratio / 0.75, 1.0)
-            + 0.20 * (1.0 - min(abs(aspect - 2.5) / 2.5, 1.0))
-        )
-
-        if score <= best_score:
-            continue
-
-        best_score = score
-
-        # Convert the downscaled ROI coordinates back to full-frame coords.
-        center_x = x0 + int(round((x + w * 0.50) / scale))
-        center_y = y0 + int(round((y + h * 0.50) / scale))
-
-        full_x = x0 + int(round(x / scale))
-        full_y = y0 + int(round(y / scale))
-        full_w = max(1, int(round(w / scale)))
-        full_h = max(1, int(round(h / scale)))
-
-        best = {
-            "cx": int(max(0, min(W - 1, center_x))),
-            "cy": int(max(0, min(H - 1, center_y))),
-            "bbox": (full_x, full_y, full_w, full_h),
-            "area": float(area / (scale * scale)),
-            "score": float(score),
-            "aspect": float(aspect),
-            "area_ratio": float(fill),
-        }
-
-    return best
 
 
 def fit_circle_least_squares(contour):
@@ -1415,31 +1258,6 @@ def detect_circle(frame):
     return detect_circle_hough(frame)
 
 
-def same_play_again_target(a, b):
-    """
-    Match two Play Again button detections so one transient yellow shape
-    cannot trigger a click by itself.
-    """
-    ax, ay = a["cx"], a["cy"]
-    bx, by = b["cx"], b["cy"]
-
-    center_dist = math.hypot(
-        ax - bx,
-        ay - by
-    )
-
-    aw, ah = a["bbox"][2], a["bbox"][3]
-    bw, bh = b["bbox"][2], b["bbox"][3]
-
-    return (
-        center_dist <= max(25.0, max(aw, bw) * 0.12)
-        and
-        abs(aw - bw) <= max(30.0, max(aw, bw) * 0.20)
-        and
-        abs(ah - bh) <= max(20.0, max(ah, bh) * 0.20)
-    )
-
-
 def same_target(a, b):
     """
     Decide whether two detections are still the same physical circle.
@@ -1680,7 +1498,7 @@ def main():
     print("=" * 70)
     print("scrcpy title:", SCRCPY_TITLE)
     print("SPACE = auto click ON/OFF | R = reset stats | Q = quit")
-    print("[MODE] Strict circle detection + result-page Play Again handling.")
+    print("[MODE] Strict circle detection. No click until 3 consecutive frames confirm a real target.")
 
     hwnd = find_scrcpy()
     if not hwnd:
@@ -1711,20 +1529,6 @@ def main():
     pending = None
     candidate_target = None
     candidate_streak = 0
-
-    # Result-page state. While this page is visible, circle detection/clicking
-    # is completely disabled and only "Play again" is handled.
-    play_again_target = None
-    play_again_candidate_streak = 0
-    play_again_active = False
-    play_again_gone_frames = 0
-    play_again_last_click_at = 0.0
-    play_again_clicks = 0
-
-    # Cached result-page detection to reduce per-frame CPU load.
-    last_play_again_scan_at = 0.0
-    cached_play_again = None
-
     overlay_target = None
     overlay_time = 0.0
     last_region_update = 0.0
@@ -1760,154 +1564,11 @@ def main():
             frame_idx += 1
             fh, fw = frame.shape[:2]
 
-            # ==================================================
-            # RESULT PAGE HAS PRIORITY OVER CIRCLE DETECTION.
-            #
-            # When the "You won!" page is visible:
-            #   1) confirm the Play again button for 2 frames;
-            #   2) click its center;
-            #   3) keep clicking while the page remains visible;
-            #   4) after 3 consecutive page-miss frames, resume circle
-            #      detection from a clean state.
-            #
-            # This completely prevents the trophy/buttons/text on the
-            # result page from being interpreted as circle targets.
-            # ==================================================
-            # Do not run the relatively expensive page detector on every
-            # captured frame. Once per 80 ms is fast enough for the result
-            # page, while keeping the circle detector responsive.
-            page_now = time.perf_counter()
-            if (
-                page_now - last_play_again_scan_at
-                >= PLAY_AGAIN_SCAN_INTERVAL_MS / 1000.0
-            ):
-                page_t0 = page_now
-                cached_play_again = detect_play_again_page(frame)
-                page_det_ms = (
-                    time.perf_counter() - page_t0
-                ) * 1000.0
-                last_play_again_scan_at = time.perf_counter()
-            else:
-                page_det_ms = 0.0
-
-            play_again = cached_play_again
-            target = None
-
-            if play_again is not None:
-                # Result page is visible, so any old circle state is invalid.
-                pending = None
-                candidate_target = None
-                candidate_streak = 0
-
-                if (
-                    play_again_target is not None
-                    and
-                    same_play_again_target(
-                        play_again,
-                        play_again_target
-                    )
-                ):
-                    play_again_candidate_streak += 1
-                else:
-                    play_again_target = play_again
-                    play_again_candidate_streak = 1
-
-                play_again_gone_frames = 0
-                overlay_target = None
-                overlay_time = time.perf_counter()
-
-                if play_again_candidate_streak < PLAY_AGAIN_CONFIRM_FRAMES:
-                    state = (
-                        f"PLAY AGAIN DETECT "
-                        f"{play_again_candidate_streak}/"
-                        f"{PLAY_AGAIN_CONFIRM_FRAMES}"
-                    )
-                else:
-                    play_again_active = True
-
-                    age_ms = (
-                        time.perf_counter()
-                        - play_again_last_click_at
-                    ) * 1000.0
-
-                    # First click immediately after confirmation, then
-                    # repeat only while the button is still really visible.
-                    if (
-                        play_again_last_click_at <= 0.0
-                        or
-                        age_ms >= PLAY_AGAIN_RECLICK_INTERVAL_MS
-                    ):
-                        click_x = region[0] + int(play_again["cx"])
-                        click_y = region[1] + int(play_again["cy"])
-
-                        dispatch_ms, ok = tapper.tap(
-                            click_x,
-                            click_y,
-                            hwnd
-                        )
-
-                        play_again_last_click_at = time.perf_counter()
-                        last_dispatch = dispatch_ms
-                        play_again_clicks += 1
-
-                        if ok:
-                            click_count += 1
-                            dispatch_times.append(dispatch_ms)
-                            state = "PLAY AGAIN - CLICK"
-                        else:
-                            failed += 1
-                            state = "PLAY AGAIN - TAP FAILED"
-                    else:
-                        state = "PLAY AGAIN - WAIT"
-
-                # Do not run any circle detection logic on this page.
-                last_det = 0.0
-
-            else:
-                # No result page detected.
-                if play_again_active:
-                    play_again_gone_frames += 1
-
-                    # Do not immediately switch back on a single missed frame.
-                    # Only after the page is truly gone do we clear all page
-                    # state and start looking for the next circle.
-                    if (
-                        play_again_gone_frames
-                        < PLAY_AGAIN_GONE_CONFIRM_FRAMES
-                    ):
-                        state = (
-                            f"PLAY AGAIN PAGE LEAVING "
-                            f"({play_again_gone_frames}/"
-                            f"{PLAY_AGAIN_GONE_CONFIRM_FRAMES})"
-                        )
-                        last_det = 0.0
-                    else:
-                        play_again_active = False
-                        play_again_target = None
-                        cached_play_again = None
-                        last_play_again_scan_at = 0.0
-                        play_again_candidate_streak = 0
-                        play_again_gone_frames = 0
-                        play_again_last_click_at = 0.0
-
-                        pending = None
-                        candidate_target = None
-                        candidate_streak = 0
-
-                        state = "GAME PAGE GONE - WAITING FOR CIRCLE"
-                        last_det = 0.0
-
-                else:
-                    play_again_target = None
-                    play_again_candidate_streak = 0
-                    play_again_gone_frames = 0
-
-                    # Only now is circle detection enabled again.
-                    t1 = time.perf_counter()
-                    target = detect_circle(frame)
-                    last_det = (time.perf_counter() - t1) * 1000
-                    cap_times.append(last_cap)
-                    det_times.append(last_det)
+            t1 = time.perf_counter()
+            target = detect_circle(frame)
+            last_det = (time.perf_counter() - t1) * 1000
+            cap_times.append(last_cap)
+            det_times.append(last_det)
 
             # ==================================================
             # TARGET -> CLICK CENTER -> KEEP CLICKING UNTIL THE
@@ -2209,14 +1870,6 @@ def main():
                     pending = None
                     candidate_target = None
                     candidate_streak = 0
-                    play_again_target = None
-                    play_again_candidate_streak = 0
-                    play_again_active = False
-                    play_again_gone_frames = 0
-                    play_again_last_click_at = 0.0
-                    play_again_clicks = 0
-                    last_play_again_scan_at = 0.0
-                    cached_play_again = None
                     print("[CONTROL] Stats reset")
 
     except KeyboardInterrupt:
@@ -2240,7 +1893,6 @@ def main():
     print(f"Targets completed     : {confirmed}")
     print(f"Tap failures          : {failed}")
     print(f"Extra center clicks   : {retries}")
-    print(f"Play Again clicks     : {play_again_clicks}")
     print(f"Avg capture           : {avg(cap_times):.2f} ms")
     print(f"Avg OpenCV detection  : {avg(det_times):.2f} ms")
     print(f"Avg tap dispatch      : {avg(dispatch_times):.2f} ms")
