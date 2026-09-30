@@ -133,20 +133,84 @@ def find_scrcpy():
 
 
 def client_region(hwnd):
+    """
+    Return the visible scrcpy client region in physical screen coordinates.
+
+    A maximized/tall scrcpy window can extend a few pixels below the physical
+    monitor boundary. DXCam rejects any region outside the monitor, so clamp
+    the client rectangle before handing it to the capture backend.
+    """
     rect = wintypes.RECT()
-    if not user32.GetClientRect(hwnd, ctypes.byref(rect)):
+
+    if not user32.GetClientRect(
+        hwnd,
+        ctypes.byref(rect)
+    ):
         return None
 
     w = rect.right - rect.left
     h = rect.bottom - rect.top
+
     if w <= 0 or h <= 0:
         return None
 
     pt = wintypes.POINT(0, 0)
-    if not user32.ClientToScreen(hwnd, ctypes.byref(pt)):
+
+    if not user32.ClientToScreen(
+        hwnd,
+        ctypes.byref(pt)
+    ):
         return None
 
-    return (pt.x, pt.y, pt.x + w, pt.y + h)
+    left = int(pt.x)
+    top = int(pt.y)
+    right = int(pt.x + w)
+    bottom = int(pt.y + h)
+
+    # DXCam captures the physical desktop. Keep the requested rectangle
+    # completely inside the primary desktop bounds.
+    screen_w = int(
+        user32.GetSystemMetrics(0)
+    )
+    screen_h = int(
+        user32.GetSystemMetrics(1)
+    )
+
+    left = max(
+        0,
+        min(
+            left,
+            screen_w - 1
+        )
+    )
+    top = max(
+        0,
+        min(
+            top,
+            screen_h - 1
+        )
+    )
+    right = max(
+        left + 1,
+        min(
+            right,
+            screen_w
+        )
+    )
+    bottom = max(
+        top + 1,
+        min(
+            bottom,
+            screen_h
+        )
+    )
+
+    return (
+        left,
+        top,
+        right,
+        bottom
+    )
 
 
 class Capture:
@@ -178,10 +242,44 @@ class Capture:
 
         left, top, right, bottom = self.region
 
+        # Defensive clamp on every capture too. This protects against a
+        # transient window move/resize between region refreshes.
+        screen_w = int(
+            user32.GetSystemMetrics(0)
+        )
+        screen_h = int(
+            user32.GetSystemMetrics(1)
+        )
+
+        left = max(0, min(left, screen_w - 1))
+        top = max(0, min(top, screen_h - 1))
+        right = max(left + 1, min(right, screen_w))
+        bottom = max(top + 1, min(bottom, screen_h))
+
+        self.region = (
+            left,
+            top,
+            right,
+            bottom
+        )
+
         if self.backend == "DXCAM":
-            return self.dx.grab(
-                region=(left, top, right, bottom)
-            )
+            try:
+                return self.dx.grab(
+                    region=(
+                        left,
+                        top,
+                        right,
+                        bottom
+                    )
+                )
+            except ValueError as exc:
+                # DXCam is strict about monitor bounds. Re-read the window
+                # geometry once before failing the frame.
+                raise RuntimeError(
+                    "DXCam region invalid after screen clamp: "
+                    + str(exc)
+                ) from exc
 
         raw = np.asarray(
             self.mss.grab(
