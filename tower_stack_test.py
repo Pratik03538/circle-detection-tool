@@ -2493,17 +2493,20 @@ def main():
                         )
 
                 else:
-                    tracker.update(
-                        moving,
-                        current_time,
-                    )
-
-                    last_mover = moving
-                    last_target = target
+                    # A horizontally moving colored rectangle without a real
+                    # target directly below it is not enough to start gameplay.
+                    # This prevents unrelated animations/UI from warming the
+                    # velocity tracker.
+                    if target is None:
+                        tracker.reset()
+                        state = (
+                            "SCANNING - "
+                            "REAL TARGET NOT RESOLVED"
+                        )
 
                     # Ignore countdown/GO-like changes until the mover is
                     # actually in the lower gameplay area.
-                    if (
+                    elif (
                         not game_started
                         and
                         moving["cy"]
@@ -2517,6 +2520,14 @@ def main():
                         )
 
                     else:
+                        tracker.update(
+                            moving,
+                            current_time,
+                        )
+
+                        last_mover = moving
+                        last_target = target
+
                         if (
                             not game_started
                             and
