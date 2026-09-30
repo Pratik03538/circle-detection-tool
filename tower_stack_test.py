@@ -1113,6 +1113,8 @@ def main():
     tap_moving_width = 0.0
     tap_target_width = 0.0
     tap_target = None
+    tap_predicted_center = 0.0
+    tap_prediction_error = 0.0
     post_tap_missing = 0
 
     frame_index = 0
@@ -1293,7 +1295,7 @@ def main():
 
                     if tap_target is not None:
                         overlap = overlap_width(
-                            tap_x,
+                            tap_predicted_center,
                             tap_moving_width,
                             tap_target,
                         )
@@ -1315,11 +1317,7 @@ def main():
                         )
 
                         center_errors.append(
-                            abs(
-                                tap_x
-                                -
-                                tap_target["cx"]
-                            )
+                            float(tap_prediction_error)
                         )
 
                     drop_active = False
@@ -1328,6 +1326,8 @@ def main():
                     target_band = None
                     drop_point = None
                     tap_target = None
+                    tap_predicted_center = 0.0
+                    tap_prediction_error = 0.0
                     post_tap_missing = 0
                     state = "LANDING CONFIRMED"
 
@@ -1345,6 +1345,8 @@ def main():
                     target_band = None
                     drop_point = None
                     tap_target = None
+                    tap_predicted_center = 0.0
+                    tap_prediction_error = 0.0
                     post_tap_missing = 0
                     rescan_events += 1
                     state = "LANDING UNCERTAIN - RESCAN"
@@ -1561,6 +1563,19 @@ def main():
                                         candidate_target["w"]
                                     )
 
+                                    # Record the predicted moving-block centre
+                                    # at the actual click lead. This is the real
+                                    # timing/prediction accuracy metric; tap_x is
+                                    # intentionally the target centre.
+                                    tap_predicted_center = float(
+                                        predicted_x
+                                    )
+                                    tap_prediction_error = float(
+                                        abs(
+                                            predicted_x - desired
+                                        )
+                                    )
+
                                     tap_started_at = (
                                         time.perf_counter()
                                     )
@@ -1759,6 +1774,8 @@ def main():
                     drop_point = None
                     drop_active = False
                     tap_target = None
+                    tap_predicted_center = 0.0
+                    tap_prediction_error = 0.0
                     post_tap_missing = 0
 
                     frames = 0
