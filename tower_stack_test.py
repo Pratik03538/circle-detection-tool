@@ -2,6 +2,7 @@ import ctypes
 from ctypes import wintypes
 from collections import deque
 import math
+import random
 import time
 
 import cv2
@@ -79,9 +80,17 @@ PREDICTION_TOLERANCE_MIN = 6.0
 PREDICTION_TOLERANCE_RATIO = 0.10
 SAFE_OVERLAP_RATIO = 0.30
 
-# User requested three extremely fast taps at the same drop point.
+# User requested three extremely fast taps.
 BURST_TAPS = 3
 BURST_GAP_MS = 0
+
+# The tap is deliberately NOT forced to the exact centre. For each drop,
+# choose one random point in a small area around the moving block. All three
+# taps of that burst use that same random point so the burst stays extremely
+# fast while avoiding a fixed centre click.
+RANDOM_CLICK_X_HALF_WIDTH = 0.35
+RANDOM_CLICK_Y_HALF_HEIGHT = 0.75
+RANDOM_CLICK_MIN_DISTANCE_FROM_CENTER = 0.10
 
 # Landing verification.
 LANDING_VERTICAL_CHANGE_PX = 3.0
@@ -1423,6 +1432,80 @@ def overlap_width(cx, moving_width, target):
     )
 
 
+def random_click_near_block(
+    moving,
+    frame_width,
+    frame_height,
+):
+    """
+    Return a random screen-local click point near the moving block.
+
+    The point is generated around the block centre, but is never deliberately
+    locked to the exact centre. It remains close enough to stay inside/near
+    the moving block and safely inside the game area.
+    """
+    if moving is None:
+        return (
+            frame_width * 0.5,
+            frame_height * 0.5,
+        )
+
+    cx = float(moving["cx"])
+    cy = float(moving["cy"])
+    half_w = max(
+        8.0,
+        float(moving["w"]) * RANDOM_CLICK_X_HALF_WIDTH,
+    )
+    half_h = max(
+        6.0,
+        float(moving["h"]) * RANDOM_CLICK_Y_HALF_HEIGHT,
+    )
+
+    # Draw until the point is not too close to the exact centre.
+    for _ in range(8):
+        dx = random.uniform(
+            -half_w,
+            half_w,
+        )
+        dy = random.uniform(
+            -half_h,
+            half_h,
+        )
+
+        distance = math.hypot(
+            dx / max(half_w, 1.0),
+            dy / max(half_h, 1.0),
+        )
+
+        if distance >= RANDOM_CLICK_MIN_DISTANCE_FROM_CENTER:
+            break
+
+    # Keep the random point inside the playable horizontal area so an
+    # accidental title-bar/outside click cannot occur.
+    left_limit = frame_width * GAME_X0
+    right_limit = frame_width * GAME_X1
+    top_limit = frame_height * GAME_Y0
+    bottom_limit = frame_height * GAME_Y1
+
+    px = max(
+        left_limit + 2.0,
+        min(
+            right_limit - 2.0,
+            cx + dx,
+        ),
+    )
+
+    py = max(
+        top_limit + 2.0,
+        min(
+            bottom_limit - 2.0,
+            cy + dy,
+        ),
+    )
+
+    return float(px), float(py)
+
+
 def click_lead_seconds(frame_dt):
     lead = (
         0.5 * max(0.0, frame_dt)
@@ -1592,6 +1675,8 @@ def main():
     tap_target = None
     tap_predicted_center = 0.0
     tap_prediction_error = 0.0
+    tap_random_x = 0.0
+    tap_random_y = 0.0
     post_tap_missing = 0
 
     frame_index = 0
@@ -1849,6 +1934,8 @@ def main():
                     tap_target = None
                     tap_predicted_center = 0.0
                     tap_prediction_error = 0.0
+                    tap_random_x = 0.0
+                    tap_random_y = 0.0
                     post_tap_missing = 0
                     state = "LANDING CONFIRMED"
 
@@ -2119,15 +2206,36 @@ def main():
                                         time.perf_counter()
                                     )
 
+                                    # Keep the drop prediction based on
+                                    # the moving block, but randomize the actual
+                                    # screen click point around that block. The
+                                    # three clicks still share ONE point, so the
+                                    # burst stays extremely fast.
+                                    (
+                                        tap_random_x,
+                                        tap_random_y,
+                                    ) = random_click_near_block(
+                                        candidate,
+                                        frame_w,
+                                        frame_h,
+                                    )
+
                                     screen_x = (
                                         region[0]
                                         +
-                                        tap_x
+                                        tap_random_x
                                     )
                                     screen_y = (
                                         region[1]
                                         +
-                                        tap_moving_y
+                                        tap_random_y
+                                    )
+
+                                    tap_random_x = float(
+                                        tap_random_x
+                                    )
+                                    tap_random_y = float(
+                                        tap_random_y
                                     )
 
                                     (
@@ -2303,6 +2411,14 @@ def main():
                             drop_point
                         )))
                     ),
+                    "Random Tap: {}".format(
+                        "-"
+                        if tap_random_x == 0.0
+                        else "{},{}".format(
+                            int(round(tap_random_x)),
+                            int(round(tap_random_y)),
+                        )
+                    ),
                     "Drops: {}  Lands: {}".format(
                         drops,
                         lands,
@@ -2354,6 +2470,8 @@ def main():
                     tap_target = None
                     tap_predicted_center = 0.0
                     tap_prediction_error = 0.0
+                    tap_random_x = 0.0
+                    tap_random_y = 0.0
                     post_tap_missing = 0
 
                     frames = 0
