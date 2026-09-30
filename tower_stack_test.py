@@ -81,13 +81,11 @@ PREDICTION_TOLERANCE_RATIO = 0.10
 SAFE_OVERLAP_RATIO = 0.30
 
 # User requested three extremely fast taps.
-BURST_TAPS = 3
-BURST_GAP_MS = 0
+# One click only per block.
+SINGLE_CLICK = True
 
 # The tap is deliberately NOT forced to the exact centre. For each drop,
-# choose one random point in a small area around the moving block. All three
-# taps of that burst use that same random point so the burst stays extremely
-# fast while avoiding a fixed centre click.
+# choose one random point in a small area around the moving block.
 RANDOM_CLICK_X_HALF_WIDTH = 0.35
 RANDOM_CLICK_Y_HALF_HEIGHT = 0.75
 RANDOM_CLICK_MIN_DISTANCE_FROM_CENTER = 0.10
@@ -356,18 +354,12 @@ class Capture:
 
 
 class Tapper:
-    """
-    One Windows SendInput call containing:
-        DOWN UP DOWN UP DOWN UP
-    There is no intentional sleep between the three taps.
-    """
+    """Send exactly one real left click to the selected screen point."""
 
-    def burst(self, screen_x, screen_y, hwnd):
+    def click(self, screen_x, screen_y, hwnd):
         started = time.perf_counter()
 
         try:
-            # Do not force focus on every drop. The match gate pre-focuses
-            # scrcpy once, and a conditional focus repair is enough.
             if user32.GetForegroundWindow() != hwnd:
                 user32.SetForegroundWindow(hwnd)
 
@@ -377,24 +369,30 @@ class Tapper:
             if not user32.SetCursorPos(px, py):
                 return 0.0, False, 0
 
-            inputs = (INPUT * (BURST_TAPS * 2))()
+            inputs = (INPUT * 2)()
 
-            for i in range(BURST_TAPS):
-                down = i * 2
-                up = down + 1
+            inputs[0].type = INPUT_MOUSE
+            inputs[0].mi = MOUSEINPUT(
+                0,
+                0,
+                0,
+                MOUSEEVENTF_LEFTDOWN,
+                0,
+                0,
+            )
 
-                inputs[down].type = INPUT_MOUSE
-                inputs[down].mi = MOUSEINPUT(
-                    0, 0, 0, MOUSEEVENTF_LEFTDOWN, 0, 0
-                )
-
-                inputs[up].type = INPUT_MOUSE
-                inputs[up].mi = MOUSEINPUT(
-                    0, 0, 0, MOUSEEVENTF_LEFTUP, 0, 0
-                )
+            inputs[1].type = INPUT_MOUSE
+            inputs[1].mi = MOUSEINPUT(
+                0,
+                0,
+                0,
+                MOUSEEVENTF_LEFTUP,
+                0,
+                0,
+            )
 
             sent = user32.SendInput(
-                BURST_TAPS * 2,
+                2,
                 inputs,
                 ctypes.sizeof(INPUT),
             )
@@ -405,7 +403,7 @@ class Tapper:
 
             return (
                 elapsed_ms,
-                sent == BURST_TAPS * 2,
+                sent == 2,
                 int(sent),
             )
 
@@ -415,6 +413,8 @@ class Tapper:
                 False,
                 0,
             )
+
+
 
 
 def game_roi(frame):
@@ -1588,7 +1588,7 @@ def main():
     print("[READY] Live screen monitor starts immediately.")
     print("[READY] Waiting for the real Tower Stack match screen.")
     print("[READY] No tap is sent while matching/waiting.")
-    print("[MODE] Motion prediction + 3 ultra-fast taps per drop.")
+    print("[MODE] Motion prediction + ONE random single click per drop.")
 
     hwnd = find_scrcpy()
 
@@ -2242,7 +2242,7 @@ def main():
                                         dispatch_ms,
                                         ok,
                                         sent,
-                                    ) = tapper.burst(
+                                    ) = tapper.click(
                                         screen_x,
                                         screen_y,
                                         hwnd,
@@ -2283,7 +2283,7 @@ def main():
                                         drop_active = True
                                         post_tap_missing = 0
                                         state = (
-                                            "3-TAP BURST @ "
+                                            "SINGLE CLICK @ "
                                             "{},{}".format(
                                                 int(round(tap_x)),
                                                 int(round(
@@ -2295,7 +2295,7 @@ def main():
                                         tap_failures += 1
                                         tracker.reset()
                                         state = (
-                                            "TAP FAILED {}/6".format(
+                                            "TAP FAILED {}/2".format(
                                                 sent
                                             )
                                         )
@@ -2426,9 +2426,7 @@ def main():
                     "Tap failures: {}".format(
                         tap_failures
                     ),
-                    "Burst: {} taps / event".format(
-                        BURST_TAPS
-                    ),
+                    "Click mode: SINGLE CLICK",
                 ]
 
                 y = 22
@@ -2585,7 +2583,7 @@ def main():
 
     if dispatch_values:
         print(
-            "Avg burst dispatch      : {:.2f} ms".format(
+            "Avg single-click dispatch: {:.2f} ms".format(
                 float(np.mean(
                     dispatch_values
                 ))
