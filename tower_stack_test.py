@@ -84,6 +84,29 @@ LANDING_MISS_FRAMES = 3
 BASE_BOTTOM_TOLERANCE_PX = 45
 GAME_OVER_MISS_FRAMES = 18
 
+# ------------------------------------------------------------
+# MATCH / GAME READY GATE
+# ------------------------------------------------------------
+# The bot can be started while another phone page is visible.
+# Gameplay detection is disabled until the real Tower Stack
+# pre-game screen is visually confirmed for several frames.
+MATCH_READY_CONFIRM_FRAMES = 10
+
+MATCH_READY_X0 = 0.17
+MATCH_READY_X1 = 0.83
+MATCH_READY_Y0 = 0.30
+MATCH_READY_Y1 = 0.955
+
+MATCH_SCORE_X0 = 0.30
+MATCH_SCORE_X1 = 0.75
+MATCH_SCORE_Y0 = 0.22
+MATCH_SCORE_Y1 = 0.31
+
+MATCH_START_X0 = 0.30
+MATCH_START_X1 = 0.70
+MATCH_START_Y0 = 0.88
+MATCH_START_Y1 = 0.96
+
 
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(2)
@@ -382,6 +405,157 @@ def game_roi(frame):
         int(round(h * GAME_Y0)),
         int(round(h * GAME_Y1)),
     )
+
+
+def detect_match_ready_screen(frame):
+    """
+    Confirm the actual Tower Stack pre-game layout.
+
+    This intentionally does not use OCR or generic bright-object detection.
+    It requires the same structural layout seen in the supplied recording:
+      - large dark play board;
+      - yellow SCORE widget;
+      - neutral FLOOR widget;
+      - wide light TAP TO START button.
+    """
+    H, W = frame.shape[:2]
+
+    # ---- Main game board ----
+    bx0 = int(round(W * MATCH_READY_X0))
+    bx1 = int(round(W * MATCH_READY_X1))
+    by0 = int(round(H * MATCH_READY_Y0))
+    by1 = int(round(H * MATCH_READY_Y1))
+
+    board = frame[by0:by1, bx0:bx1]
+    if board.size == 0:
+        return False
+
+    board_gray = cv2.cvtColor(
+        board,
+        cv2.COLOR_BGR2GRAY
+    )
+
+    if (
+        float(np.mean(board_gray)) >= 90.0
+        or
+        float(np.mean(board_gray < 85)) < 0.70
+    ):
+        return False
+
+    # ---- SCORE / FLOOR widgets ----
+    sx0 = int(round(W * MATCH_SCORE_X0))
+    sx1 = int(round(W * MATCH_SCORE_X1))
+    sy0 = int(round(H * MATCH_SCORE_Y0))
+    sy1 = int(round(H * MATCH_SCORE_Y1))
+
+    score_roi = frame[sy0:sy1, sx0:sx1]
+    if score_roi.size == 0:
+        return False
+
+    hsv = cv2.cvtColor(
+        score_roi,
+        cv2.COLOR_BGR2HSV
+    )
+
+    yellow = cv2.inRange(
+        hsv,
+        np.array([15, 90, 140], dtype=np.uint8),
+        np.array([40, 255, 255], dtype=np.uint8)
+    )
+
+    yellow_ratio = float(
+        np.mean(yellow > 0)
+    )
+
+    # Floor box in the recording is dark blue/gray, so avoid requiring a
+    # bright gray area. Instead, check that the expected right-side widget
+    # contains a compact low-saturation rectangle-like region.
+    floor_x0 = int(round(W * 0.54))
+    floor_x1 = int(round(W * 0.74))
+    floor_roi = frame[
+        int(round(H * 0.245)):
+        int(round(H * 0.295)),
+        floor_x0:floor_x1
+    ]
+
+    floor_gray = cv2.cvtColor(
+        floor_roi,
+        cv2.COLOR_BGR2GRAY
+    ) if floor_roi.size else None
+
+    floor_ok = False
+
+    if floor_gray is not None and floor_gray.size:
+        # A widget-sized area should be measurably brighter than the
+        # surrounding dark header/background, even when its fill is gray.
+        floor_mean = float(np.mean(floor_gray))
+        floor_p70 = float(np.percentile(floor_gray, 70))
+        floor_ok = (
+            floor_mean >= 25.0
+            and
+            floor_p70 >= 45.0
+        )
+
+    if yellow_ratio < 0.045 or not floor_ok:
+        return False
+
+    # ---- TAP TO START button ----
+    tx0 = int(round(W * MATCH_START_X0))
+    tx1 = int(round(W * MATCH_START_X1))
+    ty0 = int(round(H * MATCH_START_Y0))
+    ty1 = int(round(H * MATCH_START_Y1))
+
+    start_roi = frame[ty0:ty1, tx0:tx1]
+    if start_roi.size == 0:
+        return False
+
+    start_gray = cv2.cvtColor(
+        start_roi,
+        cv2.COLOR_BGR2GRAY
+    )
+
+    bright = (
+        start_gray >= 105
+    ).astype(np.uint8) * 255
+
+    bright = cv2.morphologyEx(
+        bright,
+        cv2.MORPH_CLOSE,
+        np.ones((5, 5), np.uint8),
+        iterations=1
+    )
+
+    contours, _ = cv2.findContours(
+        bright,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    for contour in contours:
+        area = cv2.contourArea(contour)
+
+        if area < (
+            start_roi.shape[0]
+            *
+            start_roi.shape[1]
+            *
+            0.06
+        ):
+            continue
+
+        x, y, w, h = cv2.boundingRect(contour)
+        aspect = w / float(max(h, 1))
+
+        if (
+            2.5 <= aspect <= 9.5
+            and
+            w >= start_roi.shape[1] * 0.35
+            and
+            h >= start_roi.shape[0] * 0.15
+        ):
+            return True
+
+    return False
 
 
 def make_block_mask(frame):
@@ -1130,8 +1304,9 @@ def main():
     print("=" * 72)
     print("scrcpy title:", SCRCPY_TITLE)
     print("SPACE = auto click ON/OFF | R = reset stats | Q = quit")
-    print("[READY] Live scan starts immediately.")
-    print("[READY] Start Tower Stack after this message.")
+    print("[READY] Live screen monitor starts immediately.")
+    print("[READY] Waiting for the real Tower Stack match screen.")
+    print("[READY] No tap is sent while matching/waiting.")
     print("[MODE] Motion prediction + 3 ultra-fast taps per drop.")
 
     hwnd = find_scrcpy()
@@ -1200,6 +1375,10 @@ def main():
     game_started = False
     base_missing = 0
 
+    # Match/session gate.
+    match_ready = False
+    match_ready_streak = 0
+
     moving_band = None
     target_band = None
     drop_point = None
@@ -1246,9 +1425,43 @@ def main():
 
             frame_h, frame_w = frame.shape[:2]
 
-            bands, spans, span_y0 = detect_block_data(
-                frame
-            )
+            # --------------------------------------------------------
+            # MATCH GATE
+            #
+            # Until the actual Tower Stack pre-game layout is confirmed,
+            # no block detection or motion tracking is allowed.
+            # This is intentionally a visual match check, not a timer.
+            # --------------------------------------------------------
+            if not match_ready:
+                if detect_match_ready_screen(frame):
+                    match_ready_streak += 1
+                else:
+                    match_ready_streak = 0
+
+                if match_ready_streak >= MATCH_READY_CONFIRM_FRAMES:
+                    match_ready = True
+                    match_ready_streak = 0
+                    tracker.reset()
+                    game_started = False
+                    base_missing = 0
+                    print(
+                        "[MATCH] Tower Stack pre-game screen confirmed."
+                    )
+                    print(
+                        "[MATCH] Waiting for you to start the game."
+                    )
+
+            if match_ready:
+                bands, spans, span_y0 = detect_block_data(
+                    frame
+                )
+            else:
+                # Feed nothing to the gameplay detector while waiting.
+                bands = []
+                spans = []
+                span_y0 = int(
+                    round(frame_h * GAME_Y0)
+                )
 
             # Base is only used after gameplay has actually started.
             base_exists = any(
@@ -1725,6 +1938,17 @@ def main():
                                             )
                                         )
 
+            # The match gate is authoritative while the game has not
+            # been visually matched.
+            if not match_ready:
+                state = (
+                    "WAITING FOR TOWER MATCH "
+                    "{}/{}".format(
+                        match_ready_streak,
+                        MATCH_READY_CONFIRM_FRAMES,
+                    )
+                )
+
             # --------------------------------------------------------
             # OUTPUT
             # --------------------------------------------------------
@@ -1867,6 +2091,8 @@ def main():
                     tracker.reset()
                     game_started = False
                     base_missing = 0
+                    match_ready = False
+                    match_ready_streak = 0
                     moving_band = None
                     target_band = None
                     drop_point = None
