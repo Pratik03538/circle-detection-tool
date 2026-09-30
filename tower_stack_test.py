@@ -892,442 +892,455 @@ def detect_match_ready_screen(frame):
 # Moving block from frame difference
 # ============================================================
 
-def detect_moving_block(
-    frame,
-    previous_gray,
-    tracked_y=None,
-):
-    if previous_gray is None:
-        return None, 0.0
+def longest_row_run(row, min_width=5):
+    xs = np.flatnonzero(row)
 
+    if xs.size == 0:
+        return None
+
+    breaks = np.flatnonzero(
+        np.diff(xs) > 1
+    )
+
+    starts = np.r_[0, breaks + 1]
+    ends = np.r_[breaks, xs.size - 1]
+
+    lengths = ends - starts + 1
+    idx = int(np.argmax(lengths))
+
+    if int(lengths[idx]) < min_width:
+        return None
+
+    return (
+        int(xs[starts[idx]]),
+        int(xs[ends[idx]]),
+    )
+
+
+def detect_colored_bands(frame):
+    """
+    Detect the horizontal colored rectangles that form the Tower.
+
+    Row-wise spans are used because touching blocks merge into one connected
+    component. Each differently positioned horizontal band stays separate.
+    """
     height, width = frame.shape[:2]
 
-    x0, x1, y0, y1 = game_roi(
-        frame
-    )
-
-    current_gray = cv2.cvtColor(
-        frame,
-        cv2.COLOR_BGR2GRAY,
-    )
-
-    current_roi = current_gray[
-        y0:y1,
-        x0:x1
-    ]
-
-    previous_roi = previous_gray[
-        y0:y1,
-        x0:x1
-    ]
-
-    scale = MOTION_DETECT_SCALE
-
-    small_w = max(
-        1,
-        int(
-            round(
-                current_roi.shape[1]
-                *
-                scale
-            )
-        ),
-    )
-
-    small_h = max(
-        1,
-        int(
-            round(
-                current_roi.shape[0]
-                *
-                scale
-            )
-        ),
-    )
-
-    small_current = cv2.resize(
-        current_roi,
-        (small_w, small_h),
-        interpolation=cv2.INTER_AREA,
-    )
-
-    small_previous = cv2.resize(
-        previous_roi,
-        (small_w, small_h),
-        interpolation=cv2.INTER_AREA,
-    )
-
-    diff = cv2.absdiff(
-        small_current,
-        small_previous,
-    )
-
-    motion = (
-        diff
-        >=
-        MOTION_DIFF_THRESHOLD
-    ).astype(np.uint8) * 255
-
-    motion = cv2.morphologyEx(
-        motion,
-        cv2.MORPH_OPEN,
-        np.ones(
-            (2, 2),
-            np.uint8,
-        ),
-        iterations=1,
-    )
-
-    motion = cv2.morphologyEx(
-        motion,
-        cv2.MORPH_CLOSE,
-        np.ones(
-            (3, 3),
-            np.uint8,
-        ),
-        iterations=1,
-    )
-
-    row_counts = (
-        motion > 0
-    ).sum(axis=1)
-
-    min_changed = max(
-        MOTION_ROW_CHANGE_MIN_PIXELS,
-        int(
-            round(
-                small_w
-                *
-                MOTION_ROW_CHANGE_RATIO
-            )
-        ),
-    )
-
-    rows = np.flatnonzero(
-        row_counts >= min_changed
-    )
-
-    if rows.size == 0:
-        return None, 0.0
-
-    # Merge row ranges separated by up to 2 processed rows.
-    breaks = np.flatnonzero(
-        np.diff(rows) > 2
-    )
-
-    starts = np.r_[
-        0,
-        breaks + 1,
-    ]
-
-    ends = np.r_[
-        breaks,
-        rows.size - 1,
-    ]
+    x0, x1, y0, y1 = game_roi(frame)
+    roi = frame[y0:y1, x0:x1]
 
     hsv = cv2.cvtColor(
-        frame,
+        roi,
         cv2.COLOR_BGR2HSV,
     )
 
-    color = (
-        (
-            hsv[:, :, 1]
-            >=
-            COLOR_MIN_SATURATION
-        )
+    mask = (
+        (hsv[:, :, 1] >= COLOR_MIN_SATURATION)
         &
-        (
-            hsv[:, :, 2]
-            >=
-            COLOR_MIN_VALUE
-        )
+        (hsv[:, :, 2] >= COLOR_MIN_VALUE)
     ).astype(np.uint8)
+
+    spans = []
+
+    for row in mask:
+        run = longest_row_run(
+            row > 0,
+            min_width=4,
+        )
+
+        if run is None:
+            spans.append(None)
+        else:
+            spans.append(
+                (
+                    float(x0 + run[0]),
+                    float(x0 + run[1]),
+                )
+            )
+
+    bands = []
+    i = 0
+
+    while i < len(spans):
+        if spans[i] is None:
+            i += 1
+            continue
+
+        segment = [spans[i]]
+        j = i + 1
+
+        previous_left, previous_right = spans[i]
+
+        while j < len(spans):
+            current = spans[j]
+
+            if current is None:
+                if (
+                    j + 1 < len(spans)
+                    and
+                    spans[j + 1] is not None
+                ):
+                    j += 1
+                    continue
+
+                break
+
+            left, right = current
+
+            if (
+                abs(left - previous_left) > 6.0
+                or
+                abs(right - previous_right) > 6.0
+            ):
+                break
+
+            segment.append(current)
+            previous_left = left
+            previous_right = right
+            j += 1
+
+        block_height = float(j - i)
+
+        if (
+            MIN_BLOCK_HEIGHT
+            <=
+            block_height
+            <=
+            MAX_BLOCK_HEIGHT
+        ):
+            arr = np.asarray(
+                segment,
+                dtype=np.float64,
+            )
+
+            left = float(
+                np.median(arr[:, 0])
+            )
+
+            right = float(
+                np.median(arr[:, 1])
+            )
+
+            block_width = (
+                right
+                -
+                left
+                +
+                1.0
+            )
+
+            aspect = (
+                block_width
+                /
+                max(
+                    block_height,
+                    1.0,
+                )
+            )
+
+            if (
+                MIN_BLOCK_WIDTH
+                <=
+                block_width
+                <=
+                MAX_BLOCK_WIDTH
+                and
+                0.25
+                <=
+                aspect
+                <=
+                16.0
+            ):
+                bands.append(
+                    {
+                        "x0": left,
+                        "x1": right,
+                        "y0": float(y0 + i),
+                        "y1": float(y0 + j - 1),
+                        "cx": (
+                            left
+                            +
+                            right
+                        )
+                        *
+                        0.5,
+                        "cy": (
+                            y0 + i
+                            +
+                            y0 + j - 1
+                        )
+                        *
+                        0.5,
+                        "w": block_width,
+                        "h": block_height,
+                    }
+                )
+
+        i = max(
+            i + 1,
+            j,
+        )
+
+    bands.sort(
+        key=lambda item: item["y0"]
+    )
+
+    return bands
+
+
+def reset_motion_detector():
+    detect_moving_block._previous_bands = []
+    detect_moving_block._last_moving = None
+    detect_moving_block._motion_streak = 0
+
+
+def detect_moving_block(
+    frame,
+    previous_gray=None,
+    tracked_y=None,
+):
+    """
+    Detect the true moving block by horizontal displacement of a rectangular
+    band between consecutive frames.
+
+    This intentionally ignores broad frame-difference blobs. During camera
+    scrolling, many static tower blocks change vertically; their horizontal
+    coordinate stays almost unchanged.
+    """
+    bands = detect_colored_bands(frame)
+
+    previous_bands = getattr(
+        detect_moving_block,
+        "_previous_bands",
+        [],
+    )
 
     candidates = []
 
-    for start_index, end_index in zip(
-        starts,
-        ends,
-    ):
-        small_y0 = int(
-            rows[start_index]
-        )
-        small_y1 = int(
-            rows[end_index]
-        )
+    for current in bands:
+        best = None
 
-        full_y0 = int(
-            round(
-                y0 +
-                small_y0 / scale
-            )
-        )
-
-        full_y1 = int(
-            round(
-                y0 +
-                (
-                    small_y1 + 1
-                )
-                /
-                scale
-            )
-        )
-
-        full_y0 = max(
-            y0,
-            full_y0,
-        )
-
-        full_y1 = min(
-            y1,
-            full_y1,
-        )
-
-        band_height = (
-            full_y1 -
-            full_y0
-        )
-
-        if not (
-            MOTION_BAND_MIN_HEIGHT
-            <=
-            band_height
-            <=
-            MOTION_BAND_MAX_HEIGHT
-        ):
-            continue
-
-        if (
-            full_y1
-            <
-            int(
-                round(
-                    height
-                    *
-                    MOVING_Y_MIN_RATIO
-                )
-            )
-        ):
-            continue
-
-        # Find the current colored block inside the motion band.
-        band = run_to_band(
-            frame,
-            max(
-                y0,
-                full_y0 - 2
-            ),
-            min(
-                y1,
-                full_y1 + 3
-            ),
-            x0,
-            x1,
-            color,
-        )
-
-        if band is None:
-            continue
-
-        # Motion score for this y band.
-        diff_score = float(
-            np.sum(
-                row_counts[
-                    small_y0:
-                    small_y1 + 1
-                ]
-            )
-        )
-
-        width_score = min(
-            band["w"],
-            180.0,
-        )
-
-        proximity_bonus = 1.0
-
-        if tracked_y is not None:
-            delta_y = abs(
-                band["cy"]
+        for previous in previous_bands:
+            y_error = abs(
+                current["cy"]
                 -
-                tracked_y
+                previous["cy"]
             )
 
-            proximity_bonus += max(
-                0.0,
-                1.0
+            width_error = abs(
+                current["w"]
                 -
-                min(
-                    1.0,
-                    delta_y / 80.0,
-                ),
+                previous["w"]
             )
 
-        score = (
-            diff_score
-            *
-            (
-                1.0
-                +
-                width_score / 120.0
+            if y_error > 7.0:
+                continue
+
+            if width_error > max(
+                24.0,
+                previous["w"] * 0.28,
+            ):
+                continue
+
+            dx = (
+                current["cx"]
+                -
+                previous["cx"]
             )
-            *
-            proximity_bonus
-        )
 
-        band["motion_score"] = (
-            float(score)
-        )
+            if best is None or abs(dx) > abs(best[0]):
+                best = (
+                    dx,
+                    previous,
+                )
 
-        candidates.append(
-            band
-        )
+        if best is not None:
+            dx, previous = best
+
+            if abs(dx) >= 2.0:
+                # Prefer a candidate that also resembles the last confirmed
+                # mover, but keep the strongest real horizontal displacement.
+                continuity = 0.0
+
+                last_moving = getattr(
+                    detect_moving_block,
+                    "_last_moving",
+                    None,
+                )
+
+                if last_moving is not None:
+                    continuity = max(
+                        0.0,
+                        2.0
+                        -
+                        abs(
+                            current["cx"]
+                            -
+                            last_moving["cx"]
+                        )
+                        /
+                        40.0,
+                    )
+
+                score = (
+                    abs(dx)
+                    +
+                    continuity
+                    -
+                    y_error * 0.20
+                )
+
+                candidates.append(
+                    (
+                        score,
+                        dx,
+                        current,
+                    )
+                )
 
     if not candidates:
+        detect_moving_block._previous_bands = bands
+        detect_moving_block._last_moving = None
+        detect_moving_block._motion_streak = 0
         return None, 0.0
 
     candidates.sort(
-        key=lambda item: (
-            item["motion_score"],
-            item["w"],
-        ),
+        key=lambda item: item[0],
         reverse=True,
     )
 
-    best = candidates[0]
+    _, dx, current = candidates[0]
 
-    detect_ms = 0.0
-    return (
-        best,
-        detect_ms,
+    direction = (
+        1
+        if dx > 0
+        else -1
     )
 
+    last_moving = getattr(
+        detect_moving_block,
+        "_last_moving",
+        None,
+    )
 
-# ============================================================
-# Target directly below moving block
-# ============================================================
+    if (
+        last_moving is not None
+        and
+        last_moving.get("frame_direction")
+        not in
+        (0, direction)
+    ):
+        # This is either a real bounce or a candidate switch. Require one more
+        # consistent frame before allowing a drop decision.
+        detect_moving_block._motion_streak = 1
+    else:
+        detect_moving_block._motion_streak = (
+            getattr(
+                detect_moving_block,
+                "_motion_streak",
+                0,
+            )
+            +
+            1
+        )
+
+    current["frame_dx"] = float(dx)
+    current["frame_direction"] = int(direction)
+    current["motion_score"] = float(abs(dx))
+
+    detect_moving_block._previous_bands = bands
+    detect_moving_block._last_moving = dict(
+        current
+    )
+
+    if (
+        detect_moving_block._motion_streak
+        >=
+        2
+    ):
+        return current, 0.0
+
+    return None, 0.0
+
 
 def detect_target_below(
     frame,
     moving,
 ):
+    """
+    Return the closest actual tower block below the moving block.
+
+    The target must be horizontally overlapped by the moving block before the
+    drop. This rejects unrelated bright UI/particles and lower tower blocks.
+    """
     if moving is None:
         return None
 
-    height, width = frame.shape[:2]
-
-    x0, x1, y0, y1 = game_roi(
-        frame
-    )
-
-    mask = color_mask(
-        frame
-    )
-
-    start_y = max(
-        y0,
-        int(
-            round(
-                moving["y1"]
-                +
-                TARGET_SEARCH_BELOW_MIN
-            )
-        ),
-    )
-
-    end_y = min(
-        y1,
-        int(
-            round(
-                moving["y1"]
-                +
-                TARGET_SEARCH_BELOW_MAX
-            )
-        ),
-    )
-
+    bands = detect_colored_bands(frame)
     candidates = []
 
-    for window_y0 in range(
-        start_y,
-        max(
-            start_y,
-            end_y - TARGET_STABLE_ROWS + 1
-        ),
-    ):
-        window_y1 = min(
-            end_y,
-            window_y0
-            +
-            TARGET_STABLE_ROWS,
-        )
-
-        if window_y1 <= window_y0:
-            continue
-
-        band = run_to_band(
-            frame,
-            window_y0,
-            window_y1,
-            x0,
-            x1,
-            mask,
-        )
-
-        if band is None:
-            continue
-
-        # Do not accept the moving block itself.
-        if (
-            abs(
-                band["x0"]
-                -
-                moving["x0"]
-            )
-            <=
-            2.5
-            and
-            abs(
-                band["x1"]
-                -
-                moving["x1"]
-            )
-            <=
-            2.5
-        ):
-            continue
-
-        # Target should start below the moving block, not overlap it.
-        if (
+    for band in bands:
+        gap = (
             band["y0"]
-            <
-            moving["y1"] - 1.0
-        ):
+            -
+            moving["y1"]
+        )
+
+        if gap < -1.0 or gap > 35.0:
+            continue
+
+        overlap = (
+            min(
+                moving["x1"],
+                band["x1"],
+            )
+            -
+            max(
+                moving["x0"],
+                band["x0"],
+            )
+        )
+
+        if overlap <= 2.0:
+            continue
+
+        overlap_ratio = (
+            overlap
+            /
+            max(
+                1.0,
+                min(
+                    moving["w"],
+                    band["w"],
+                ),
+            )
+        )
+
+        if overlap_ratio < 0.08:
             continue
 
         candidates.append(
-            band
+            (
+                gap,
+                -overlap_ratio,
+                -band["w"],
+                band,
+            )
         )
 
     if not candidates:
         return None
 
-    # Closest stable band below the moving block.
     candidates.sort(
         key=lambda item: (
-            max(
-                0.0,
-                item["y0"]
-                -
-                moving["y1"]
-            ),
-            -item["w"],
+            item[0],
+            item[1],
+            item[2],
         )
     )
 
-    return candidates[0]
+    return candidates[0][3]
+
 
 
 # ============================================================
@@ -2021,6 +2034,7 @@ def main():
                     game_started = False
                     drop_active = False
                     previous_gray = None
+                    reset_motion_detector()
 
                     # Pre-focus once.
                     user32.SetForegroundWindow(
@@ -2249,10 +2263,8 @@ def main():
                     # Seed the next block immediately. We do NOT leave the
                     # tracker in a stale post-tap state.
                     tracker.reset()
-                    tracker.update(
-                        new_mover,
-                        current_time,
-                    )
+                    reset_motion_detector()
+
 
                     last_mover = new_mover
                     last_target = new_target
@@ -2282,6 +2294,7 @@ def main():
                     uncertain_landings += 1
 
                     tracker.reset()
+                    reset_motion_detector()
 
                     drop_active = False
                     tap_target = None
