@@ -29,8 +29,10 @@ SCRCPY_TITLE = "CHESS_MOBILE"
 OUTPUT_TITLE = "TOWER STACK - BOT TEST"
 
 AUTO_CLICK_START = True
-SHOW_OUTPUT = True
-DISPLAY_EVERY = 2
+# Keep the debug window OFF during live play. It consumes CPU and can steal
+# foreground focus from scrcpy. Turn it on only while debugging detection.
+SHOW_OUTPUT = False
+DISPLAY_EVERY = 3
 
 # The supplied video is 480x800. Normalized ROI also works when scrcpy
 # is resized while keeping the phone aspect ratio.
@@ -54,6 +56,10 @@ MAX_BLOCK_ASPECT = 14.0
 ROW_SPAN_CHANGE = 6.0
 ROW_MEDIAN_WINDOW = 5
 
+# Half-resolution detection keeps block tracking fast while coordinates are
+# converted back to the full scrcpy frame.
+BLOCK_DETECT_SCALE = 0.50
+
 # Motion tracking.
 MOTION_HISTORY = 7
 MIN_MOVING_SPEED = 45.0
@@ -64,8 +70,10 @@ MAX_WIDTH_TRACK_ERROR = 60.0
 STARTUP_MIN_MOVING_Y_RATIO = 0.60
 
 # Prediction.
-CLICK_LEAD_MIN_MS = 7.0
-CLICK_LEAD_MAX_MS = 22.0
+CLICK_LEAD_MIN_MS = 10.0
+CLICK_LEAD_MAX_MS = 55.0
+INITIAL_CLICK_LEAD_MS = 30.0
+CLICK_LEAD_EMA_ALPHA = 0.35
 PREDICTION_MAX_SEC = 2.50
 PREDICTION_TOLERANCE_MIN = 6.0
 PREDICTION_TOLERANCE_RATIO = 0.10
@@ -349,7 +357,10 @@ class Tapper:
         started = time.perf_counter()
 
         try:
-            user32.SetForegroundWindow(hwnd)
+            # Do not force focus on every drop. The match gate pre-focuses
+            # scrcpy once, and a conditional focus repair is enough.
+            if user32.GetForegroundWindow() != hwnd:
+                user32.SetForegroundWindow(hwnd)
 
             px = int(round(screen_x))
             py = int(round(screen_y))
@@ -656,27 +667,107 @@ def longest_run(row, min_width):
 
 
 def build_row_spans(frame):
+    """
+    Fast block mask at half resolution.
+
+    The returned spans use full-frame x coordinates while each list element
+    represents approximately 1 / BLOCK_DETECT_SCALE source rows.
+    """
     x0, x1, y0, y1 = game_roi(frame)
-    roi = frame[y0:y1, x0:x1]
-    mask = make_block_mask(roi)
+
+    roi = frame[
+        y0:y1,
+        x0:x1
+    ]
+
+    scale = BLOCK_DETECT_SCALE
+
+    small_w = max(
+        1,
+        int(round(roi.shape[1] * scale))
+    )
+
+    small_h = max(
+        1,
+        int(round(roi.shape[0] * scale))
+    )
+
+    small = cv2.resize(
+        roi,
+        (small_w, small_h),
+        interpolation=cv2.INTER_AREA
+    )
+
+    hsv = cv2.cvtColor(
+        small,
+        cv2.COLOR_BGR2HSV
+    )
+
+    s = hsv[:, :, 1]
+    v = hsv[:, :, 2]
+
+    b = small[:, :, 0].astype(np.int16)
+    g = small[:, :, 1].astype(np.int16)
+    r = small[:, :, 2].astype(np.int16)
+
+    spread = (
+        np.maximum(
+            np.maximum(b, g),
+            r
+        )
+        -
+        np.minimum(
+            np.minimum(b, g),
+            r
+        )
+    )
+
+    mask = (
+        (s >= MIN_SATURATION)
+        &
+        (v >= MIN_VALUE)
+        &
+        (spread >= MIN_COLOR_SPREAD)
+    ).astype(np.uint8) * 255
+
+    mask = cv2.morphologyEx(
+        mask,
+        cv2.MORPH_OPEN,
+        np.ones((3, 3), np.uint8),
+        iterations=1
+    )
+
+    min_run = max(
+        6,
+        int(round(
+            MIN_RUN_WIDTH * scale
+        ))
+    )
 
     spans = []
 
     for row in mask:
         run = longest_run(
             row,
-            MIN_RUN_WIDTH,
+            min_run,
         )
 
         if run is None:
             spans.append(None)
-        else:
-            spans.append(
-                (
-                    float(run[0] + x0),
-                    float(run[1] + x0),
-                )
+            continue
+
+        spans.append(
+            (
+                float(
+                    x0 +
+                    run[0] / scale
+                ),
+                float(
+                    x0 +
+                    run[1] / scale
+                ),
             )
+        )
 
     return (
         median_smooth_spans(
@@ -684,10 +775,15 @@ def build_row_spans(frame):
             ROW_MEDIAN_WINDOW,
         ),
         y0,
+        scale,
     )
 
 
-def spans_to_bands(spans, y0):
+def spans_to_bands(
+    spans,
+    y0,
+    row_scale=1.0,
+):
     bands = []
     i = 0
 
@@ -698,6 +794,7 @@ def spans_to_bands(spans, y0):
 
         segment = [spans[i]]
         j = i + 1
+
         last = np.array(
             spans[i],
             dtype=np.float64,
@@ -709,7 +806,8 @@ def spans_to_bands(spans, y0):
             if current is None:
                 if (
                     j + 2 < len(spans)
-                    and spans[j + 1] is not None
+                    and
+                    spans[j + 1] is not None
                 ):
                     j += 1
                     continue
@@ -720,14 +818,35 @@ def spans_to_bands(spans, y0):
                 dtype=np.float64,
             )
 
-            if np.max(np.abs(cur - last)) > ROW_SPAN_CHANGE:
+            if np.max(
+                np.abs(cur - last)
+            ) > ROW_SPAN_CHANGE:
                 break
 
-            segment.append(current)
+            segment.append(
+                current
+            )
             last = cur
             j += 1
 
-        height = j - i
+        top = (
+            y0
+            +
+            i / row_scale
+        )
+
+        bottom = (
+            y0
+            +
+            (j - 1 + 0.95)
+            / row_scale
+        )
+
+        height = (
+            bottom -
+            top +
+            1.0
+        )
 
         if (
             MIN_BLOCK_HEIGHT
@@ -739,10 +858,33 @@ def spans_to_bands(spans, y0):
                 dtype=np.float64,
             )
 
-            left = float(np.median(arr[:, 0]))
-            right = float(np.median(arr[:, 1]))
-            width = right - left + 1.0
-            aspect = width / float(max(height, 1))
+            left = float(
+                np.median(
+                    arr[:, 0]
+                )
+            )
+
+            right = float(
+                np.median(
+                    arr[:, 1]
+                )
+            )
+
+            width = (
+                right -
+                left +
+                1.0
+            )
+
+            aspect = (
+                width /
+                float(
+                    max(
+                        height,
+                        1
+                    )
+                )
+            )
 
             if (
                 MIN_BLOCK_WIDTH
@@ -757,29 +899,59 @@ def spans_to_bands(spans, y0):
                     {
                         "x0": left,
                         "x1": right,
-                        "y0": float(y0 + i),
-                        "y1": float(y0 + j - 1),
-                        "cx": (left + right) * 0.5,
-                        "cy": (y0 + i + y0 + j - 1) * 0.5,
+                        "y0": float(top),
+                        "y1": float(bottom),
+                        "cx": (
+                            left +
+                            right
+                        ) * 0.5,
+                        "cy": (
+                            top +
+                            bottom
+                        ) * 0.5,
                         "w": width,
                         "h": float(height),
                     }
                 )
 
-        i = max(i + 1, j)
+        i = max(
+            i + 1,
+            j,
+        )
 
     bands.sort(
-        key=lambda b: (b["y0"], b["x0"])
+        key=lambda b: (
+            b["y0"],
+            b["x0"],
+        )
     )
+
     return bands
 
 
 def detect_block_data(frame):
-    spans, y0 = build_row_spans(frame)
-    return spans_to_bands(spans, y0), spans, y0
+    spans, y0, row_scale = (
+        build_row_spans(frame)
+    )
+
+    return (
+        spans_to_bands(
+            spans,
+            y0,
+            row_scale,
+        ),
+        spans,
+        y0,
+        row_scale,
+    )
 
 
-def target_below_from_spans(spans, y0, moving):
+def target_below_from_spans(
+    spans,
+    y0,
+    moving,
+    row_scale=1.0,
+):
     """
     Find the first stable horizontal block below the moving block.
     The few rows immediately touching the moving block are skipped because
@@ -791,12 +963,31 @@ def target_below_from_spans(spans, y0, moving):
     bottom = int(round(moving["y1"]))
     start = max(
         0,
-        bottom - y0 + 2,
+        int(
+            round(
+                (bottom - y0)
+                * row_scale
+            )
+        ) + 1,
     )
+
+    search_height = max(
+        45.0,
+        moving["h"] * 2.4,
+    )
+
     end = min(
         len(spans),
-        bottom - y0
-        + int(round(max(45.0, moving["h"] * 2.4))),
+        int(
+            round(
+                (
+                    bottom -
+                    y0 +
+                    search_height
+                )
+                * row_scale
+            )
+        ),
     )
 
     pieces = []
@@ -837,8 +1028,15 @@ def target_below_from_spans(spans, y0, moving):
 
             left = float(np.median(arr[:, 0]))
             right = float(np.median(arr[:, 1]))
-            top = float(y0 + i)
-            bottom2 = float(y0 + j - 1)
+            top = float(
+                y0 +
+                i / row_scale
+            )
+            bottom2 = float(
+                y0 +
+                (j - 1 + 0.95) /
+                row_scale
+            )
             width = right - left + 1.0
             height = bottom2 - top + 1.0
             aspect = width / float(max(height, 1))
@@ -1359,6 +1557,8 @@ def main():
     run_start = time.perf_counter()
     last_time = time.perf_counter()
     last_frame_dt = 1.0 / 60.0
+    click_lead_ms = INITIAL_CLICK_LEAD_MS
+    click_dispatch_ema = None
 
     frames = 0
     motion_frames = 0
@@ -1447,12 +1647,21 @@ def main():
                     print(
                         "[MATCH] Tower Stack pre-game screen confirmed."
                     )
+                    # Pre-focus scrcpy once now, instead of paying the focus
+                    # switch cost during the first drop.
+                    user32.SetForegroundWindow(hwnd)
+
                     print(
                         "[MATCH] Waiting for you to start the game."
                     )
 
             if match_ready:
-                bands, spans, span_y0 = detect_block_data(
+                (
+                    bands,
+                    spans,
+                    span_y0,
+                    span_row_scale,
+                ) = detect_block_data(
                     frame
                 )
             else:
@@ -1529,6 +1738,7 @@ def main():
                         spans,
                         span_y0,
                         candidate,
+                        span_row_scale,
                     )
                 )
 
@@ -1797,10 +2007,28 @@ def main():
                                     "TRACKING - REPLAN"
                                 )
                             else:
-                                lead = (
-                                    click_lead_seconds(
-                                        last_frame_dt
+                                # Predict to the expected touch-arrival time.
+                                # Fixed 7-22ms was too short for this live
+                                # Windows/scrcpy setup; adapt from measured
+                                # burst dispatch time.
+                                if click_dispatch_ema is None:
+                                    click_lead_ms = (
+                                        INITIAL_CLICK_LEAD_MS
                                     )
+                                else:
+                                    click_lead_ms = max(
+                                        CLICK_LEAD_MIN_MS,
+                                        min(
+                                            CLICK_LEAD_MAX_MS,
+                                            click_dispatch_ema
+                                            +
+                                            last_frame_dt * 1000.0 * 0.50,
+                                        ),
+                                    )
+
+                                lead = (
+                                    click_lead_ms /
+                                    1000.0
                                 )
 
                                 predicted_x = (
@@ -1918,6 +2146,32 @@ def main():
 
                                     if ok:
                                         drops += 1
+
+                                        if click_dispatch_ema is None:
+                                            click_dispatch_ema = (
+                                                float(dispatch_ms)
+                                            )
+                                        else:
+                                            click_dispatch_ema = (
+                                                CLICK_LEAD_EMA_ALPHA
+                                                *
+                                                float(dispatch_ms)
+                                                +
+                                                (1.0 - CLICK_LEAD_EMA_ALPHA)
+                                                *
+                                                click_dispatch_ema
+                                            )
+
+                                        click_lead_ms = max(
+                                            CLICK_LEAD_MIN_MS,
+                                            min(
+                                                CLICK_LEAD_MAX_MS,
+                                                click_dispatch_ema
+                                                +
+                                                last_frame_dt * 1000.0 * 0.50,
+                                            ),
+                                        )
+
                                         drop_active = True
                                         post_tap_missing = 0
                                         state = (
@@ -2113,6 +2367,9 @@ def main():
                     overlap_values.clear()
                     dispatch_values.clear()
                     landing_values.clear()
+
+                    click_dispatch_ema = None
+                    click_lead_ms = INITIAL_CLICK_LEAD_MS
 
                     run_start = time.perf_counter()
                     print(
