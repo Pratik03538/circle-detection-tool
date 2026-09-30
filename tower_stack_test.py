@@ -1515,6 +1515,7 @@ def choose_drop_point(moving, target):
         needed
     )
 
+    # Exact target centre maximizes symmetric margin on both sides.
     ideal = target["cx"]
 
     return (
@@ -1812,12 +1813,21 @@ def main():
                     region = current_region
                     capture.set_region(region)
 
-            frame_capture_time = time.perf_counter()
+            grab_started = time.perf_counter()
             frame = capture.grab()
 
             if frame is None:
                 state = "NO FRAME"
                 continue
+
+            # Timestamp the returned image as close as possible to the actual
+            # processing start. Prediction compensates for processing +
+            # input dispatch, without double-counting the DXCam grab duration.
+            frame_capture_time = time.perf_counter()
+            capture_ms = (
+                frame_capture_time -
+                grab_started
+            ) * 1000.0
 
             frames += 1
             frame_index += 1
@@ -2630,7 +2640,8 @@ def main():
                                             "TARGET x0={:.1f} x1={:.1f} "
                                             "cx={:.1f} w={:.1f} | "
                                             "V={:+.1f}px/s | "
-                                            "frame_age={:.1f}ms | "
+                                            "capture={:.1f}ms | "
+                                            "decision_age={:.1f}ms | "
                                             "lead={:.1f}ms | "
                                             "pred={:.1f} | "
                                             "target={:.1f} | "
@@ -2649,8 +2660,9 @@ def main():
                                                 candidate_target["cx"],
                                                 candidate_target["w"],
                                                 vx,
+                                                capture_ms,
                                                 frame_age_ms,
-                                                decision_to_click_ms,
+                                                effective_lead_ms,
                                                 predicted_x,
                                                 desired,
                                                 prediction_error,
@@ -2961,6 +2973,11 @@ def main():
     print(
         "Rescan / uncertain      :",
         rescan_events,
+    )
+    print(
+        "Final timing bias       : {:+.2f} ms".format(
+            timing_bias_ms
+        )
     )
 
     if center_errors:
