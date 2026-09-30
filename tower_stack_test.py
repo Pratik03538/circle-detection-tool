@@ -46,11 +46,11 @@ GAME_Y1 = 0.955
 MIN_SATURATION = 45
 MIN_VALUE = 90
 MIN_COLOR_SPREAD = 30
-MIN_RUN_WIDTH = 15
+MIN_RUN_WIDTH = 4
 
-MIN_BLOCK_WIDTH = 20
+MIN_BLOCK_WIDTH = 6
 MAX_BLOCK_WIDTH = 200
-MIN_BLOCK_HEIGHT = 8
+MIN_BLOCK_HEIGHT = 4
 MAX_BLOCK_HEIGHT = 34
 MIN_BLOCK_ASPECT = 0.75
 MAX_BLOCK_ASPECT = 14.0
@@ -59,7 +59,9 @@ ROW_MEDIAN_WINDOW = 5
 
 # Half-resolution detection keeps block tracking fast while coordinates are
 # converted back to the full scrcpy frame.
-BLOCK_DETECT_SCALE = 0.50
+BLOCK_DETECT_SCALE = 0.75
+PRECISION_SCAN_SCALE = 1.0
+PRECISION_SCAN_TRIGGER_WIDTH = 32.0
 
 # Motion tracking.
 MOTION_HISTORY = 7
@@ -675,7 +677,7 @@ def longest_run(row, min_width):
     )
 
 
-def build_row_spans(frame):
+def build_row_spans(frame, scale=None):
     """
     Fast block mask at half resolution.
 
@@ -689,7 +691,8 @@ def build_row_spans(frame):
         x0:x1
     ]
 
-    scale = BLOCK_DETECT_SCALE
+    if scale is None:
+        scale = BLOCK_DETECT_SCALE
 
     small_w = max(
         1,
@@ -938,9 +941,12 @@ def spans_to_bands(
     return bands
 
 
-def detect_block_data(frame):
+def detect_block_data(frame, scale=None):
     spans, y0, row_scale = (
-        build_row_spans(frame)
+        build_row_spans(
+            frame,
+            scale,
+        )
     )
 
     return (
@@ -953,6 +959,54 @@ def detect_block_data(frame):
         y0,
         row_scale,
     )
+
+
+def choose_moving_candidate(
+    bands,
+    tracker,
+):
+    """
+    Pick the moving block using temporal continuity. After a landing the
+    tracker is reset, so the highest playable colored band is the new mover.
+    """
+    if not bands:
+        return None
+
+    if (
+        tracker.last_seen is not None
+        and
+        tracker.missed <= MAX_TRACK_GAP
+    ):
+        best = None
+        best_distance = float("inf")
+
+        for band in bands:
+            y_error = abs(
+                band["cy"]
+                -
+                tracker.last_seen["cy"]
+            )
+
+            width_error = abs(
+                band["w"]
+                -
+                tracker.last_seen["w"]
+            )
+
+            if (
+                y_error <= MAX_Y_TRACK_ERROR
+                and
+                width_error <= MAX_WIDTH_TRACK_ERROR
+                and
+                y_error < best_distance
+            ):
+                best = band
+                best_distance = y_error
+
+        if best is not None:
+            return best
+
+    return bands[0]
 
 
 def target_below_from_spans(
@@ -1778,42 +1832,16 @@ def main():
                     base_missing += 1
 
             # --------------------------------------------------------
-            # Candidate = top-most visible block. Once the moving block
-            # exists, it is above the current tower top.
+            # Candidate moving block + target below.
+            #
+            # After a poor overlap, the surviving tower top can be extremely
+            # narrow. The fast scan is attempted first; when geometry becomes
+            # small/ambiguous, immediately run a full-resolution precision scan.
             # --------------------------------------------------------
-            candidate = None
-
-            if (
-                tracker.last_seen is not None
-                and
-                tracker.missed <= MAX_TRACK_GAP
-            ):
-                best_distance = float("inf")
-
-                for band in bands:
-                    y_error = abs(
-                        band["cy"]
-                        -
-                        tracker.last_seen["cy"]
-                    )
-                    width_error = abs(
-                        band["w"]
-                        -
-                        tracker.last_seen["w"]
-                    )
-
-                    if (
-                        y_error <= MAX_Y_TRACK_ERROR
-                        and
-                        width_error <= MAX_WIDTH_TRACK_ERROR
-                        and
-                        y_error < best_distance
-                    ):
-                        candidate = band
-                        best_distance = y_error
-
-            if candidate is None and bands:
-                candidate = bands[0]
+            candidate = choose_moving_candidate(
+                bands,
+                tracker,
+            )
 
             candidate_target = None
 
@@ -1826,6 +1854,55 @@ def main():
                         span_row_scale,
                     )
                 )
+
+            need_precision = (
+                match_ready
+                and
+                game_started
+                and
+                (
+                    candidate is None
+                    or
+                    candidate["w"] <= PRECISION_SCAN_TRIGGER_WIDTH
+                    or
+                    candidate_target is None
+                )
+            )
+
+            if need_precision:
+                (
+                    precise_bands,
+                    precise_spans,
+                    precise_y0,
+                    precise_row_scale,
+                ) = detect_block_data(
+                    frame,
+                    PRECISION_SCAN_SCALE,
+                )
+
+                precise_candidate = choose_moving_candidate(
+                    precise_bands,
+                    tracker,
+                )
+
+                if precise_candidate is not None:
+                    precise_target = (
+                        target_below_from_spans(
+                            precise_spans,
+                            precise_y0,
+                            precise_candidate,
+                            precise_row_scale,
+                        )
+                    )
+
+                    if precise_target is not None:
+                        candidate = precise_candidate
+                        candidate_target = precise_target
+                        bands = precise_bands
+                        spans = precise_spans
+                        span_y0 = precise_y0
+                        span_row_scale = precise_row_scale
+                        state = "PRECISION TRACK - SMALL BLOCK"
 
             # --------------------------------------------------------
             # GAME OVER
