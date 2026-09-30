@@ -59,7 +59,7 @@ ROW_MEDIAN_WINDOW = 5
 
 # Half-resolution detection keeps block tracking fast while coordinates are
 # converted back to the full scrcpy frame.
-BLOCK_DETECT_SCALE = 0.75
+BLOCK_DETECT_SCALE = 0.50
 PRECISION_SCAN_SCALE = 1.0
 PRECISION_SCAN_TRIGGER_WIDTH = 32.0
 
@@ -1751,6 +1751,9 @@ def main():
     last_frame_dt = 1.0 / 60.0
     click_lead_ms = INITIAL_CLICK_LEAD_MS
     click_dispatch_ema = None
+    timing_bias_ms = 0.0
+    last_drop_vx = 0.0
+    last_drop_predicted_overlap = 0.0
 
     frames = 0
     motion_frames = 0
@@ -2075,63 +2078,167 @@ def main():
                 if landing:
                     lands += 1
 
+                    # Identify the actual landed top block when the next
+                    # moving block has appeared. The landed block is the
+                    # highest stable band at/just below the old moving-block
+                    # y coordinate.
+                    landed_band = None
+
+                    eligible_landed = [
+                        b
+                        for b in bands
+                        if (
+                            abs(
+                                b["y0"]
+                                -
+                                tap_moving_y
+                            )
+                            <=
+                            max(
+                                8.0,
+                                tap_moving_width * 0.22,
+                            )
+                            and
+                            b["w"] >= 6.0
+                        )
+                    ]
+
+                    if eligible_landed:
+                        eligible_landed.sort(
+                            key=lambda b: abs(
+                                b["y0"]
+                                -
+                                tap_moving_y
+                            )
+                        )
+                        landed_band = eligible_landed[0]
+
+                    actual_error = None
+                    actual_overlap = None
+                    actual_overlap_ratio = None
+
+                    if (
+                        landed_band is not None
+                        and
+                        tap_target is not None
+                    ):
+                        actual_error = abs(
+                            landed_band["cx"]
+                            -
+                            tap_target["cx"]
+                        )
+
+                        actual_overlap = overlap_width(
+                            landed_band["cx"],
+                            landed_band["w"],
+                            tap_target,
+                        )
+
+                        actual_overlap_ratio = (
+                            actual_overlap
+                            /
+                            float(
+                                max(
+                                    1.0,
+                                    min(
+                                        landed_band["w"],
+                                        tap_target["w"],
+                                    ),
+                                )
+                            )
+                        )
+
+                        center_errors.append(
+                            float(actual_error)
+                        )
+
+                        overlap_values.append(
+                            float(actual_overlap_ratio)
+                        )
+
+                        # Learn a small correction from the real landing.
+                        # Positive timing error means the piece travelled too
+                        # far in its direction before stopping.
+                        if abs(last_drop_vx) >= 20.0:
+                            signed_error = (
+                                landed_band["cx"]
+                                -
+                                tap_target["cx"]
+                            )
+
+                            timing_error_ms = (
+                                signed_error
+                                /
+                                last_drop_vx
+                                *
+                                1000.0
+                            )
+
+                            correction_ms = max(
+                                -25.0,
+                                min(
+                                    25.0,
+                                    -timing_error_ms,
+                                ),
+                            )
+
+                            timing_bias_ms = (
+                                0.35 * timing_bias_ms
+                                +
+                                0.65 * correction_ms
+                            )
+
                     if PRINT_LANDING_LOG:
+                        if landed_band is not None:
+                            landed_text = (
+                                "LANDED x0={:.1f} x1={:.1f} "
+                                "cx={:.1f} w={:.1f}"
+                                .format(
+                                    landed_band["x0"],
+                                    landed_band["x1"],
+                                    landed_band["cx"],
+                                    landed_band["w"],
+                                )
+                            )
+                        else:
+                            landed_text = (
+                                "LANDED GEOMETRY=NOT-FOUND"
+                            )
+
                         print(
                             "[LANDING #{:03d}] "
                             "verify={:.1f}ms | "
                             "pred_error={:.1f}px | "
                             "pred_overlap={:.1f}% | "
-                            "next_top={}"
+                            "actual_error={} | "
+                            "actual_overlap={} | "
+                            "timing_bias={:+.1f}ms | "
+                            "{}"
                             .format(
                                 lands,
-                                (
-                                    time.perf_counter()
-                                    - tap_started_at
-                                ) * 1000.0,
+                                elapsed_ms,
                                 tap_prediction_error,
+                                last_drop_predicted_overlap * 100.0,
                                 (
-                                    predicted_overlap_ratio * 100.0
-                                    if 'predicted_overlap_ratio' in locals()
-                                    else 0.0
+                                    "{:.1f}px".format(actual_error)
+                                    if actual_error is not None
+                                    else "-"
                                 ),
                                 (
-                                    "DETECTED"
-                                    if candidate is not None
-                                    else "NOT-DETECTED"
+                                    "{:.1f}%".format(
+                                        actual_overlap_ratio * 100.0
+                                    )
+                                    if actual_overlap_ratio is not None
+                                    else "-"
                                 ),
+                                timing_bias_ms,
+                                landed_text,
                             )
                         )
 
                     landing_values.append(
                         elapsed_ms
                     )
-
-                    if tap_target is not None:
-                        overlap = overlap_width(
-                            tap_predicted_center,
-                            tap_moving_width,
-                            tap_target,
-                        )
-
-                        denom = max(
-                            1.0,
-                            min(
-                                tap_moving_width,
-                                tap_target_width,
-                            ),
-                        )
-
-                        overlap_ratio = (
-                            overlap / denom
-                        )
-
-                        overlap_values.append(
-                            overlap_ratio
-                        )
-
-                        center_errors.append(
-                            float(tap_prediction_error)
-                        )
 
                     drop_active = False
                     tracker.reset()
@@ -2327,8 +2434,20 @@ def main():
                                     CLICK_DECISION_SAFETY_MS
                                 )
 
+                                # timing_bias_ms is learned from the real
+                                # landed-block position of the previous move.
+                                effective_lead_ms = max(
+                                    CLICK_LEAD_MIN_MS,
+                                    min(
+                                        70.0,
+                                        decision_to_click_ms
+                                        +
+                                        timing_bias_ms,
+                                    ),
+                                )
+
                                 lead = (
-                                    decision_to_click_ms /
+                                    effective_lead_ms /
                                     1000.0
                                 )
 
@@ -2446,6 +2565,11 @@ def main():
                                         abs(
                                             predicted_x - desired
                                         )
+                                    )
+
+                                    last_drop_vx = float(vx)
+                                    last_drop_predicted_overlap = float(
+                                        predicted_overlap_ratio
                                     )
 
                                     tap_started_at = (
@@ -2787,6 +2911,9 @@ def main():
 
                     click_dispatch_ema = None
                     click_lead_ms = INITIAL_CLICK_LEAD_MS
+                    timing_bias_ms = 0.0
+                    last_drop_vx = 0.0
+                    last_drop_predicted_overlap = 0.0
 
                     run_start = time.perf_counter()
                     print(
@@ -2838,18 +2965,18 @@ def main():
 
     if center_errors:
         print(
-            "Avg center error        : {:.2f} px".format(
+            "Avg actual landing error: {:.2f} px".format(
                 float(np.mean(center_errors))
             )
         )
         print(
-            "Max center error        : {:.2f} px".format(
+            "Max actual landing error: {:.2f} px".format(
                 float(np.max(center_errors))
             )
         )
     else:
-        print("Avg center error        : -")
-        print("Max center error        : -")
+        print("Avg actual landing error: -")
+        print("Max actual landing error: -")
 
     if overlap_values:
         print(
