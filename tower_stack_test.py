@@ -63,6 +63,15 @@ BLOCK_DETECT_SCALE = 0.75
 PRECISION_SCAN_SCALE = 1.0
 PRECISION_SCAN_TRIGGER_WIDTH = 32.0
 
+# Detailed live diagnostics. These print one compact report for every drop
+# so the real prediction/timing/geometry can be checked from the terminal.
+PRINT_DROP_LOG = True
+PRINT_LANDING_LOG = True
+
+# Use the frame-capture timestamp to compensate for the complete time spent
+# between grabbing a frame and injecting the click.
+CLICK_DECISION_SAFETY_MS = 1.5
+
 # Motion tracking.
 MOTION_HISTORY = 7
 MIN_MOVING_SPEED = 45.0
@@ -1780,6 +1789,7 @@ def main():
     post_tap_missing = 0
 
     frame_index = 0
+    last_track_log_at = 0.0
 
     try:
         while True:
@@ -1799,6 +1809,7 @@ def main():
                     region = current_region
                     capture.set_region(region)
 
+            frame_capture_time = time.perf_counter()
             frame = capture.grab()
 
             if frame is None:
@@ -1809,6 +1820,14 @@ def main():
             frame_index += 1
 
             frame_h, frame_w = frame.shape[:2]
+
+            # Age of this frame at the instant processing begins. The game may
+            # already have advanced during capture itself, so this value is
+            # intentionally included in the prediction lead.
+            frame_age_ms = (
+                time.perf_counter()
+                - frame_capture_time
+            ) * 1000.0
 
             # --------------------------------------------------------
             # MATCH GATE
@@ -1950,6 +1969,44 @@ def main():
                         span_row_scale = precise_row_scale
                         state = "PRECISION TRACK - SMALL BLOCK"
 
+            # Compact live tracker diagnostic, throttled so the
+            # terminal remains readable.
+            if (
+                PRINT_DROP_LOG
+                and
+                match_ready
+                and
+                candidate is not None
+                and
+                now - last_track_log_at >= 0.50
+            ):
+                last_track_log_at = now
+
+                print(
+                    "[TRACK] mover "
+                    "x0={:.1f} x1={:.1f} cx={:.1f} w={:.1f} y={:.1f}"
+                    " | target={}"
+                    " | v={:+.1f}px/s"
+                    .format(
+                        candidate["x0"],
+                        candidate["x1"],
+                        candidate["cx"],
+                        candidate["w"],
+                        candidate["cy"],
+                        (
+                            "x0={:.1f} x1={:.1f} cx={:.1f} w={:.1f}".format(
+                                candidate_target["x0"],
+                                candidate_target["x1"],
+                                candidate_target["cx"],
+                                candidate_target["w"],
+                            )
+                            if candidate_target is not None
+                            else "NONE"
+                        ),
+                        tracker.velocity(),
+                    )
+                )
+
             # --------------------------------------------------------
             # GAME OVER
             # --------------------------------------------------------
@@ -2017,6 +2074,33 @@ def main():
 
                 if landing:
                     lands += 1
+
+                    if PRINT_LANDING_LOG:
+                        print(
+                            "[LANDING #{:03d}] "
+                            "verify={:.1f}ms | "
+                            "pred_error={:.1f}px | "
+                            "pred_overlap={:.1f}% | "
+                            "next_top={}"
+                            .format(
+                                lands,
+                                (
+                                    time.perf_counter()
+                                    - tap_started_at
+                                ) * 1000.0,
+                                tap_prediction_error,
+                                (
+                                    predicted_overlap_ratio * 100.0
+                                    if 'predicted_overlap_ratio' in locals()
+                                    else 0.0
+                                ),
+                                (
+                                    "DETECTED"
+                                    if candidate is not None
+                                    else "NOT-DETECTED"
+                                ),
+                            )
+                        )
 
                     landing_values.append(
                         elapsed_ms
@@ -2217,27 +2301,34 @@ def main():
                                     "TRACKING - REPLAN"
                                 )
                             else:
-                                # Predict to the expected touch-arrival time.
-                                # Fixed 7-22ms was too short for this live
-                                # Windows/scrcpy setup; adapt from measured
-                                # burst dispatch time.
-                                if click_dispatch_ema is None:
-                                    click_lead_ms = (
-                                        INITIAL_CLICK_LEAD_MS
+                                # Predict to the moment when the click
+                                # will actually reach the app. Include:
+                                #   frame age + processing/decision time +
+                                #   measured SendInput dispatch time.
+                                dispatch_estimate_ms = (
+                                    click_dispatch_ema
+                                    if click_dispatch_ema is not None
+                                    else INITIAL_CLICK_LEAD_MS
+                                )
+
+                                decision_to_click_ms = (
+                                    max(
+                                        0.0,
+                                        (
+                                            time.perf_counter()
+                                            -
+                                            frame_capture_time
+                                        )
+                                        * 1000.0
                                     )
-                                else:
-                                    click_lead_ms = max(
-                                        CLICK_LEAD_MIN_MS,
-                                        min(
-                                            CLICK_LEAD_MAX_MS,
-                                            click_dispatch_ema
-                                            +
-                                            last_frame_dt * 1000.0 * 0.50,
-                                        ),
-                                    )
+                                    +
+                                    dispatch_estimate_ms
+                                    +
+                                    CLICK_DECISION_SAFETY_MS
+                                )
 
                                 lead = (
-                                    click_lead_ms /
+                                    decision_to_click_ms /
                                     1000.0
                                 )
 
@@ -2264,12 +2355,30 @@ def main():
                                     desired
                                 )
 
+                                # This is the predicted overlap at the actual
+                                # expected click-arrival position.
+                                predicted_overlap_px = overlap_width(
+                                    predicted_x,
+                                    nominal_width,
+                                    candidate_target,
+                                )
+
+                                predicted_overlap_ratio = (
+                                    predicted_overlap_px
+                                    /
+                                    float(
+                                        max(
+                                            1.0,
+                                            min(
+                                                nominal_width,
+                                                candidate_target["w"],
+                                            ),
+                                        )
+                                    )
+                                )
+
                                 drop_point = desired
 
-                                # Tap when the estimated click-arrival point
-                                # reaches the target centre. A small tolerance
-                                # prevents a sub-frame timing gap from causing
-                                # the bot to miss a fast crossing.
                                 timing_window = max(
                                     0.004,
                                     min(
@@ -2283,12 +2392,21 @@ def main():
                                     ),
                                 )
 
+                                # No fixed "next crossing" delay is needed.
+                                # Click on the frame whose predicted
+                                # click-arrival position is closest to the
+                                # target centre.
                                 ready = (
-                                    time_hit
+                                    prediction_error
                                     <=
-                                    lead
-                                    +
-                                    timing_window
+                                    max(
+                                        tolerance,
+                                        abs(vx)
+                                        *
+                                        timing_window,
+                                    )
+                                    and
+                                    predicted_overlap_ratio >= 0.90
                                 )
 
                                 if not ready:
@@ -2346,7 +2464,7 @@ def main():
                                         candidate,
                                         frame_w,
                                         frame_h,
-                                        predicted_center=predicted_x,
+                                        predicted_center=candidate["cx"],
                                     )
 
                                     screen_x = (
@@ -2366,6 +2484,60 @@ def main():
                                     tap_random_y = float(
                                         tap_random_y
                                     )
+
+                                    if PRINT_DROP_LOG:
+                                        moving_left = (
+                                            predicted_x
+                                            - nominal_width * 0.5
+                                        )
+                                        moving_right = (
+                                            predicted_x
+                                            + nominal_width * 0.5
+                                        )
+
+                                        overlap_px = (
+                                            predicted_overlap_px
+                                        )
+
+                                        print(
+                                            "[DROP #{:03d}] "
+                                            "MOVING x0={:.1f} x1={:.1f} "
+                                            "cx={:.1f} w={:.1f} | "
+                                            "TARGET x0={:.1f} x1={:.1f} "
+                                            "cx={:.1f} w={:.1f} | "
+                                            "V={:+.1f}px/s | "
+                                            "frame_age={:.1f}ms | "
+                                            "lead={:.1f}ms | "
+                                            "pred={:.1f} | "
+                                            "target={:.1f} | "
+                                            "err={:.1f}px | "
+                                            "pred_edges=({:.1f},{:.1f}) | "
+                                            "overlap={:.1f}px ({:.1f}%) | "
+                                            "mouse=({:.1f},{:.1f})"
+                                            .format(
+                                                drops + 1,
+                                                candidate["x0"],
+                                                candidate["x1"],
+                                                candidate["cx"],
+                                                nominal_width,
+                                                candidate_target["x0"],
+                                                candidate_target["x1"],
+                                                candidate_target["cx"],
+                                                candidate_target["w"],
+                                                vx,
+                                                frame_age_ms,
+                                                decision_to_click_ms,
+                                                predicted_x,
+                                                desired,
+                                                prediction_error,
+                                                moving_left,
+                                                moving_right,
+                                                overlap_px,
+                                                predicted_overlap_ratio * 100.0,
+                                                tap_random_x,
+                                                tap_random_y,
+                                            )
+                                        )
 
                                     (
                                         dispatch_ms,
