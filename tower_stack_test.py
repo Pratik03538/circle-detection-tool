@@ -90,8 +90,15 @@ MIN_BLOCK_HEIGHT = 5
 MAX_BLOCK_HEIGHT = 34
 
 TARGET_SEARCH_BELOW_MIN = 3
-TARGET_SEARCH_BELOW_MAX = 55
+TARGET_SEARCH_BELOW_MAX = 35
 TARGET_STABLE_ROWS = 5
+
+# Target lock: the stationary block below the mover should not jump to a
+# different tower block because one row was rendered differently.
+TARGET_LOCK_MAX_X_SHIFT = 9.0
+TARGET_LOCK_MAX_Y_SHIFT = 6.0
+TARGET_LOCK_MAX_WIDTH_SHIFT = 22.0
+TARGET_LOCK_HOLD_FRAMES = 3
 
 # ------------------------------------------------------------
 # MOTION TRACKING
@@ -1263,18 +1270,19 @@ def detect_moving_block(
     return None, 0.0
 
 
-def detect_target_below(
+def detect_target_candidates(
     frame,
     moving,
 ):
     """
-    Return the closest actual tower block below the moving block.
+    Return all plausible stationary target blocks directly below the mover.
 
-    The target must be horizontally overlapped by the moving block before the
-    drop. This rejects unrelated bright UI/particles and lower tower blocks.
+    The target is not selected solely from the closest row. Candidates are
+    ranked by vertical gap and horizontal overlap so the tracker can lock to
+    the same stationary tower block across frames.
     """
     if moving is None:
-        return None
+        return []
 
     bands = detect_colored_bands(frame)
     candidates = []
@@ -1286,7 +1294,11 @@ def detect_target_below(
             moving["y1"]
         )
 
-        if gap < -1.0 or gap > 35.0:
+        if (
+            gap < -1.0
+            or
+            gap > TARGET_SEARCH_BELOW_MAX
+        ):
             continue
 
         overlap = (
@@ -1320,27 +1332,106 @@ def detect_target_below(
             continue
 
         candidates.append(
-            (
-                gap,
-                -overlap_ratio,
-                -band["w"],
-                band,
-            )
+            {
+                **band,
+                "gap": float(gap),
+                "overlap": float(overlap),
+                "overlap_ratio": float(overlap_ratio),
+            }
         )
-
-    if not candidates:
-        return None
 
     candidates.sort(
         key=lambda item: (
-            item[0],
-            item[1],
-            item[2],
+            item["gap"],
+            -item["overlap_ratio"],
+            -item["w"],
         )
     )
 
-    return candidates[0][3]
+    return candidates
 
+
+def choose_locked_target(
+    candidates,
+    previous_target=None,
+):
+    """
+    Keep the stationary target locked instead of allowing a single noisy
+    frame to jump to another stack layer.
+    """
+    if not candidates:
+        return (
+            previous_target
+            if previous_target is not None
+            else None
+        )
+
+    if previous_target is None:
+        return candidates[0]
+
+    stable = []
+
+    for candidate in candidates:
+        if abs(
+            candidate["cx"]
+            -
+            previous_target["cx"]
+        ) > TARGET_LOCK_MAX_X_SHIFT:
+            continue
+
+        if abs(
+            candidate["cy"]
+            -
+            previous_target["cy"]
+        ) > TARGET_LOCK_MAX_Y_SHIFT:
+            continue
+
+        if abs(
+            candidate["w"]
+            -
+            previous_target["w"]
+        ) > TARGET_LOCK_MAX_WIDTH_SHIFT:
+            continue
+
+        stable.append(candidate)
+
+    if stable:
+        stable.sort(
+            key=lambda item: (
+                abs(
+                    item["cx"]
+                    -
+                    previous_target["cx"]
+                ),
+                abs(
+                    item["cy"]
+                    -
+                    previous_target["cy"]
+                ),
+                -item["overlap_ratio"],
+            )
+        )
+
+        return stable[0]
+
+    # Do not jump to a totally different block from one bad frame.
+    return previous_target
+
+
+def detect_target_below(
+    frame,
+    moving,
+    previous_target=None,
+):
+    candidates = detect_target_candidates(
+        frame,
+        moving,
+    )
+
+    return choose_locked_target(
+        candidates,
+        previous_target,
+    )
 
 
 # ============================================================
@@ -1921,6 +2012,8 @@ def main():
 
     last_mover = None
     last_target = None
+    locked_target = None
+    target_hold_frames = 0
 
     tap_started_at = 0.0
 
@@ -2034,6 +2127,8 @@ def main():
                     game_started = False
                     drop_active = False
                     previous_gray = None
+                    locked_target = None
+                    target_hold_frames = 0
                     reset_motion_detector()
 
                     # Pre-focus once.
@@ -2111,9 +2206,55 @@ def main():
             target = None
 
             if moving is not None:
-                target = detect_target_below(
-                    frame,
-                    moving,
+                raw_target_candidates = (
+                    detect_target_candidates(
+                        frame,
+                        moving,
+                    )
+                )
+
+                new_locked_target = (
+                    choose_locked_target(
+                        raw_target_candidates,
+                        locked_target,
+                    )
+                )
+
+                if (
+                    new_locked_target is not None
+                ):
+                    if (
+                        locked_target is None
+                        or
+                        abs(
+                            new_locked_target["cx"]
+                            -
+                            locked_target["cx"]
+                        ) <= TARGET_LOCK_MAX_X_SHIFT
+                    ):
+                        target_hold_frames = min(
+                            TARGET_LOCK_HOLD_FRAMES,
+                            target_hold_frames + 1,
+                        )
+
+                    else:
+                        target_hold_frames = 0
+
+                    locked_target = dict(
+                        new_locked_target
+                    )
+
+                elif (
+                    target_hold_frames
+                    <
+                    TARGET_LOCK_HOLD_FRAMES
+                ):
+                    target_hold_frames += 1
+
+                target = (
+                    dict(locked_target)
+                    if locked_target is not None
+                    else None
                 )
 
             current_time = time.perf_counter()
@@ -2276,6 +2417,8 @@ def main():
                     tap_predicted_x = 0.0
                     tap_prediction_error = 0.0
                     tap_expected_overlap = 0.0
+                    locked_target = None
+                    target_hold_frames = 0
 
                     last_no_mover_at = current_time
 
@@ -2303,6 +2446,8 @@ def main():
                     tap_predicted_x = 0.0
                     tap_prediction_error = 0.0
                     tap_expected_overlap = 0.0
+                    locked_target = None
+                    target_hold_frames = 0
 
                     last_no_mover_at = current_time
 
@@ -2327,6 +2472,11 @@ def main():
                     tracker.update(
                         None,
                         current_time,
+                    )
+
+                    target_hold_frames = min(
+                        target_hold_frames + 1,
+                        TARGET_LOCK_HOLD_FRAMES,
                     )
 
                     last_no_mover_at = current_time
@@ -2575,6 +2725,9 @@ def main():
                                     state = (
                                         "TRACKING - "
                                         "PREDICTING DROP"
+                                        " / TARGET LOCK "
+                                        f"{target_hold_frames}/"
+                                        f"{TARGET_LOCK_HOLD_FRAMES}"
                                     )
 
                                 elif not auto_click:
@@ -2614,8 +2767,9 @@ def main():
                                             "[DROP #{:03d}] "
                                             "MOVER x0={:.1f} x1={:.1f} "
                                             "cx={:.1f} w={:.1f} y={:.1f} | "
-                                            "TARGET x0={:.1f} x1={:.1f} "
-                                            "cx={:.1f} w={:.1f} | "
+                                            "TARGET-LOCK x0={:.1f} x1={:.1f} "
+                                            "cx={:.1f} w={:.1f} "
+                                            "hold={}/{} | "
                                             "V={:+.1f}px/s | "
                                             "hit={:.1f}ms | "
                                             "decision={:.1f}ms | "
@@ -2635,6 +2789,8 @@ def main():
                                                 target["x1"],
                                                 target["cx"],
                                                 target["w"],
+                                                target_hold_frames,
+                                                TARGET_LOCK_HOLD_FRAMES,
                                                 vx,
                                                 hit_time * 1000.0,
                                                 decision_elapsed_ms,
@@ -2989,6 +3145,8 @@ def main():
 
                     last_mover = None
                     last_target = None
+                    locked_target = None
+                    target_hold_frames = 0
 
                     tap_target = None
                     tap_predicted_x = 0.0
