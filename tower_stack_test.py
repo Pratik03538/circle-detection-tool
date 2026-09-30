@@ -73,9 +73,9 @@ MAX_WIDTH_TRACK_ERROR = 60.0
 STARTUP_MIN_MOVING_Y_RATIO = 0.60
 
 # Prediction.
-CLICK_LEAD_MIN_MS = 10.0
-CLICK_LEAD_MAX_MS = 55.0
-INITIAL_CLICK_LEAD_MS = 30.0
+CLICK_LEAD_MIN_MS = 7.0
+CLICK_LEAD_MAX_MS = 20.0
+INITIAL_CLICK_LEAD_MS = 10.0
 CLICK_LEAD_EMA_ALPHA = 0.35
 PREDICTION_MAX_SEC = 2.50
 PREDICTION_TOLERANCE_MIN = 6.0
@@ -88,9 +88,9 @@ SINGLE_CLICK = True
 
 # The tap is deliberately NOT forced to the exact centre. For each drop,
 # choose one random point in a small area around the moving block.
-RANDOM_CLICK_X_HALF_WIDTH = 0.35
-RANDOM_CLICK_Y_HALF_HEIGHT = 0.75
-RANDOM_CLICK_MIN_DISTANCE_FROM_CENTER = 0.10
+RANDOM_CLICK_X_HALF_WIDTH = 0.20
+RANDOM_CLICK_Y_HALF_HEIGHT = 0.30
+RANDOM_CLICK_MIN_DISTANCE_FROM_CENTER = 0.06
 
 # Landing verification.
 LANDING_VERTICAL_CHANGE_PX = 3.0
@@ -1285,25 +1285,46 @@ class MotionTracker:
         if len(self.history) < 2:
             return 0.0
 
-        items = list(self.history)
-        values = []
+        items = list(self.history)[-5:]
 
-        for a, b in zip(items[:-1], items[1:]):
-            dt = b[0] - a[0]
+        t0 = items[0][0]
+        times = np.asarray(
+            [
+                item[0] - t0
+                for item in items
+            ],
+            dtype=np.float64,
+        )
 
-            if dt <= 1e-6:
-                continue
+        xs = np.asarray(
+            [
+                item[1]
+                for item in items
+            ],
+            dtype=np.float64,
+        )
 
-            values.append(
-                (b[1] - a[1]) / dt
-            )
-
-        if not values:
+        if len(times) < 2:
             return 0.0
 
-        return float(
-            np.median(values[-5:])
-        )
+        dt = times[-1] - times[0]
+
+        if dt <= 1e-6:
+            return 0.0
+
+        # Linear regression gives a less noisy speed estimate than using
+        # a single frame pair, which is important for fast blocks.
+        slope = np.polyfit(
+            times,
+            xs,
+            1,
+        )[0]
+
+        if not np.isfinite(slope):
+            return 0.0
+
+        return float(slope)
+
 
     def stable(self):
         if len(self.history) < MIN_MOTION_FRAMES:
@@ -1358,17 +1379,37 @@ class MotionTracker:
 
 
 def estimate_bounds(frame, moving_width):
-    h, w = frame.shape[:2]
+    """
+    Return the true CENTER travel limits of the moving block.
+
+    GAME_X0/GAME_X1 describe the visible game-board edges. The block centre
+    therefore cannot travel to the edge itself; it must remain half its width
+    inside the board.
+    """
+    _, w = frame.shape[:2]
 
     half = max(
-        10.0,
+        4.0,
         float(moving_width) * 0.5,
     )
 
-    return (
-        w * GAME_X0 - half,
-        w * GAME_X1 + half,
+    left = (
+        w * GAME_X0
+        +
+        half
     )
+
+    right = (
+        w * GAME_X1
+        -
+        half
+    )
+
+    if right <= left:
+        center = w * 0.50
+        return center, center
+
+    return left, right
 
 
 def reflected_position(
@@ -1490,6 +1531,7 @@ def random_click_near_block(
     moving,
     frame_width,
     frame_height,
+    predicted_center=None,
 ):
     """
     Return a random screen-local click point near the moving block.
@@ -1504,7 +1546,11 @@ def random_click_near_block(
             frame_height * 0.5,
         )
 
-    cx = float(moving["cx"])
+    cx = (
+        float(predicted_center)
+        if predicted_center is not None
+        else float(moving["cx"])
+    )
     cy = float(moving["cy"])
     half_w = max(
         8.0,
@@ -2220,24 +2266,29 @@ def main():
 
                                 drop_point = desired
 
-                                # No arbitrary waiting. The instant the
-                                # predicted point enters the target window,
-                                # decide.
+                                # Tap when the estimated click-arrival point
+                                # reaches the target centre. A small tolerance
+                                # prevents a sub-frame timing gap from causing
+                                # the bot to miss a fast crossing.
+                                timing_window = max(
+                                    0.004,
+                                    min(
+                                        0.018,
+                                        tolerance
+                                        /
+                                        max(
+                                            abs(vx),
+                                            1.0,
+                                        ),
+                                    ),
+                                )
+
                                 ready = (
-                                    prediction_error
-                                    <=
-                                    tolerance
-                                    or
                                     time_hit
                                     <=
-                                    (
-                                        lead
-                                        +
-                                        max(
-                                            last_frame_dt * 0.50,
-                                            0.004,
-                                        )
-                                    )
+                                    lead
+                                    +
+                                    timing_window
                                 )
 
                                 if not ready:
@@ -2295,6 +2346,7 @@ def main():
                                         candidate,
                                         frame_w,
                                         frame_h,
+                                        predicted_center=predicted_x,
                                     )
 
                                     screen_x = (
